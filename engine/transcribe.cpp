@@ -36,8 +36,21 @@ static std::string preset(const std::string& model) {
     std::string name = std::filesystem::path(model).filename().string();
     if (name.rfind("ggml-", 0) == 0) name = name.substr(5);
     if (name.size() > 4 && name.compare(name.size() - 4, 4, ".bin") == 0) name.resize(name.size() - 4);
-    for (const char* k : known)
-        if (name == k) return name;
+    for (const char *k : known)
+    {
+        if (name == k)
+        {
+            if (name == "large-v1")
+                return "large.v1";
+            if (name == "large-v2")
+                return "large.v2";
+            if (name == "large-v3")
+                return "large.v3";
+            if (name == "large-v3-turbo")
+                return "large.v3.turbo";
+            return name;
+        }
+    }
     return "";
 }
 
