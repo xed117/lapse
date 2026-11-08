@@ -91,6 +91,23 @@ if [ -f unsure.srt.bak ]; then
     fail "a backup was written for a file that was never changed"
 fi
 
+echo "== TTML with single quotes and spaces around ="
+{
+    printf "<?xml version='1.0' encoding='utf-8'?>\n<tt xmlns='http://www.w3.org/ns/ttml'><body><div>\n"
+    for i in $(seq 0 39); do
+        start=$((5000 + i * 7000 + SHIFT))
+        printf "<p begin = '%s' end = '%s'>line %d</p>\n" "$(timestamp $start | tr , .)" "$(timestamp $((start + 3000)) | tr , .)" "$i"
+    done
+    printf "</div></body></tt>\n"
+} > quoted.ttml
+run reference.srt quoted.ttml --force --no-backup
+if [ "$status" != "$SOLID" ]; then
+    fail "expected exit $SOLID for a TTML with single quotes, got $status"
+fi
+if ! grep -q "<p begin = '00:00:05.000' end = '00:00:08.000'>line 0</p>" quoted.ttml; then
+    fail "the TTML did not come back with its own quotes at the right time"
+fi
+
 echo "== --force overwrites the original and leaves a backup"
 cp pristine.srt forced.srt
 run reference.srt forced.srt --force
@@ -162,6 +179,19 @@ if ! cmp -s sidecar.srt pristine.srt; then
 fi
 if [ "$(grep -m1 -- '-->' fixed.srt)" != "$(grep -m1 -- '-->' reference.srt)" ]; then
     fail "--output did not line up with the reference"
+fi
+
+echo "== an unsure answer with --output goes beside that path"
+cp pristine.srt aside.srt
+run reference.srt aside.srt --output aside.synced.srt
+if [ "$status" != "$UNSURE" ]; then
+    fail "expected exit $UNSURE, got $status"
+fi
+if [ -f aside.synced.srt ] || [ ! -f aside.synced.lapse-unsure.srt ]; then
+    fail "the guess was not put beside the --output path"
+fi
+if [ -f aside.srt.bak ] || ! cmp -s aside.srt pristine.srt; then
+    fail "the input was backed up or touched for a guess"
 fi
 
 echo "== a format the engine does not read"
