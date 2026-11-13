@@ -78,7 +78,7 @@ VIDEO_EXTS = {
 # The engine tells us that part at startup and the rest is left alone
 SUBTITLE_EXTS = {
     ".srt", ".ass", ".ssa", ".vtt", ".sub", ".idx", ".sup", ".smi", ".sami",
-    ".ttml", ".dfxp", ".sbv", ".mpl2", ".lrc", ".stl", ".scc", ".mcc", ".cap",
+    ".ttml", ".dfxp", ".sbv", ".mpl2", ".lrc", ".stl", ".scc", ".mcc", ".cap", ".xml",
 }
 
 ENGINE_FORMATS = {".srt", ".ass", ".ssa", ".vtt"}
@@ -192,6 +192,13 @@ def output_for(srt_path):
         return None
     base, ext = os.path.splitext(srt_path)
     return base + suffix + ext
+
+
+# where the engine puts a guess it is not sure of, beside the file it would
+# otherwise have written
+def unsure_for(srt_path):
+    base, ext = os.path.splitext(output_for(srt_path) or srt_path)
+    return base + ".lapse-unsure" + ext
 
 
 def engine_formats():
@@ -366,6 +373,11 @@ def scan(path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")
                    and not blocked(os.path.join(root, d))]
 
+        # The .sub beside a .idx is the picture data of a VobSub pair, the
+        # .idx carries the times, so the engine reads that one and leaves
+        # the .sub alone rather than taking it for a MicroDVD file
+        pictures = {os.path.splitext(f)[0] for f in files if f.lower().endswith(".idx")}
+
         for filename in files:
             if filename.startswith("."):
                 continue
@@ -375,10 +387,25 @@ def scan(path):
 
             if ext in VIDEO_EXTS:
                 videos.setdefault(root, []).append((base, full_path))
+            elif ext == ".sub" and base in pictures:
+                continue
+            elif ext == ".xml" and not ttml(full_path):
+                continue
             elif ext in SUBTITLE_EXTS and not ours(base):
                 subtitles.setdefault(root, []).append((base, full_path))
 
     return videos, subtitles
+
+
+# TTML is often saved as .xml, and so is plenty that is not a subtitle
+def ttml(path):
+    try:
+        with open(path, "rb") as file:
+            head = file.read(65536)
+    except OSError:
+        return False
+    return any(tag.encode(code) in head for tag in ("<tt ", "<tt:tt ")
+               for code in ("utf-8", "utf-16-le", "utf-16-be"))
 
 
 def videos_in(directory):
@@ -417,7 +444,10 @@ def find_pairs(path, verbose=False):
 
 def wait_stable(path):
     # A file that is still being copied in gives us half a video, so leave it
-    # alone until nothing has touched it for a while
+    # alone until nothing has touched it for a while. A share whose clock
+    # runs ahead of ours stamps every file in the future, and those are
+    # taken as settled once they stop growing instead
+    last = None
     for _ in range(60):
         if not running:
             return False
@@ -425,8 +455,12 @@ def wait_stable(path):
             info = os.stat(path)
         except OSError:
             return False
-        if info.st_size > 0 and time.time() - info.st_mtime > 30:
+        age = time.time() - info.st_mtime
+        if info.st_size > 0 and age > 30:
             return True
+        if info.st_size > 0 and age < -60 and last == (info.st_size, info.st_mtime):
+            return True
+        last = (info.st_size, info.st_mtime)
         time.sleep(2)
     return False
 
@@ -436,15 +470,6 @@ def file_mtime(path):
         return os.path.getmtime(path)
     except OSError:
         return None
-
-
-def ebu_stl(path):
-    try:
-        with open(path, "rb") as file:
-            head = file.read(1024)
-    except OSError:
-        return False
-    return len(head) == 1024 and head[3:6] == b"STL" and head[8:11] == b".01"
 
 
 def previous_job(conn, video_path, srt_path):
@@ -510,7 +535,7 @@ def run_batch(conn, batch):
                 except OSError:
                     line = ""
                 clock.cancel()
-                drop_leftovers(subtitle, output_for(subtitle))
+                drop_leftovers(subtitle, output_for(subtitle), unsure_for(subtitle))
                 if not line:
                     break
 
@@ -663,7 +688,7 @@ def run_scan(conn, path, verbose=False):
             continue
         remember_tracks(conn, video)
         ext = os.path.splitext(subtitle)[1].lower()
-        if ext not in ENGINE_FORMATS or (ext == ".stl" and not ebu_stl(subtitle)):
+        if ext not in ENGINE_FORMATS:
             unsupported += 1
             continue
         if translate.ours(conn, subtitle):
@@ -803,6 +828,9 @@ def main():
         print("Dry run, nothing will be written or recorded")
 
     ENGINE_FORMATS = engine_formats()
+    # the engine reads TTML saved as .xml too, but has to look inside to know
+    if ".ttml" in ENGINE_FORMATS:
+        ENGINE_FORMATS.add(".xml")
     SUBTITLE_EXTS = SUBTITLE_EXTS | ENGINE_FORMATS
     print("Engine reads:", " ".join(sorted(ENGINE_FORMATS)))
     print("Library:", ", ".join(MEDIA_ROOTS))

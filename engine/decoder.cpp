@@ -31,7 +31,7 @@ static const int LANES = 8;
 static const int64_t PRIME_MS = 3000;
 static const int64_t PROBE_MS = 180000;
 
-static const int64_t PIECE_MS = 600000;
+static const int64_t PIECE_MS = 180000;
 
 AVFormatContext* open_file(const char* filename) {
         AVFormatContext *pFormatContext = avformat_alloc_context();
@@ -506,18 +506,9 @@ static double profile_score(const std::vector<float>& probability) {
 
 // how loud it gets when something is happening. the mean is no good, a film
 // that is silent most of the time drags it to nothing
-static double loud_level(const std::vector<int16_t>& pcm) {
-    std::vector<float> rms;
-    for (size_t at = 0; at + FRAME_SAMPLES <= pcm.size(); at += FRAME_SAMPLES) {
-        double energy = 0;
-        for (int i = 0; i < FRAME_SAMPLES; ++i) {
-            double v = pcm[at + i] / 32768.0;
-            energy += v * v;
-        }
-        rms.push_back((float)std::sqrt(energy / FRAME_SAMPLES));
-    }
-    if (rms.empty()) return TARGET_LEVEL;
-
+static double loud_level(const std::vector<float>& loudness) {
+    if (loudness.empty()) return TARGET_LEVEL;
+    std::vector<float> rms = loudness;
     size_t at = rms.size() * 9 / 10;
     std::nth_element(rms.begin(), rms.begin() + at, rms.end());
     return rms[at];
@@ -526,7 +517,7 @@ static double loud_level(const std::vector<int16_t>& pcm) {
 static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) {
     std::vector<float> probability;
     std::vector<float> loudness;
-    std::vector<float> block(FRAME_SAMPLES);
+    loudness.reserve(pcm.size() / FRAME_SAMPLES + 1);
 
     for (size_t at = 0; at + FRAME_SAMPLES <= pcm.size(); at += FRAME_SAMPLES) {
         double energy = 0;
@@ -540,7 +531,7 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
 
     if (silero) {
 
-        double boost = getenv("NOBOOST") ? 1.0 : TARGET_LEVEL * 2.0 / std::max(loud_level(pcm), 1e-5);
+        double boost = getenv("NOBOOST") ? 1.0 : TARGET_LEVEL * 2.0 / std::max(loud_level(loudness), 1e-5);
         if (boost < 1.0) boost = 1.0;
         if (boost > 12.0) boost = 12.0;
 
@@ -592,6 +583,10 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
     Fvad* modes[VAD_MODES] = {nullptr, nullptr, nullptr, nullptr};
     for (int mode = 0; mode < VAD_MODES; ++mode) {
         modes[mode] = fvad_new();
+        if (!modes[mode]) {
+            for (int m = 0; m < mode; ++m) fvad_free(modes[m]);
+            return {};
+        }
         fvad_set_mode(modes[mode], mode);
         fvad_set_sample_rate(modes[mode], RATE);
     }
@@ -635,6 +630,9 @@ static SwrContext* open_mix(const AVCodecContext* dec, int kind, int centre, int
     if (swr_alloc_set_opts2(&swr, &mono, AV_SAMPLE_FMT_S16, RATE,
                             &in, dec->sample_fmt, dec->sample_rate, 0, nullptr) < 0)
         return nullptr;
+
+    av_opt_set_int(swr, "filter_size", 16, 0);
+    av_opt_set_int(swr, "phase_shift", 8, 0);
 
     if (kind != 1) {
         std::vector<double> matrix(in.nb_channels, 0.0);
@@ -808,16 +806,23 @@ std::vector<float> speech_profile(AVFormatContext* fmt, AVCodecContext* dec_ctx,
     int winner = mixes[0];
     if (mixes.size() > 1) {
         int64_t probe_at = (int64_t)(duration_ms * 0.35);
+        std::vector<double> scores(mixes.size(), 0.0);
+        std::vector<std::thread> probes;
+        for (size_t m = 0; m < mixes.size(); m++)
+            probes.emplace_back([&, m]() {
+                std::vector<int16_t> part = decode_range(path, audio_stream_index, mixes[m], centre, left, right,
+                                                         probe_at, probe_at + PROBE_MS);
+                std::vector<float> got = analyse(part, silero);
+                if (got.empty() && silero) got = analyse(part, false);
+                scores[m] = profile_score(got);
+            });
+        for (auto& t : probes) t.join();
+
         double best = -1;
-        for (int mix : mixes) {
-            std::vector<int16_t> part = decode_range(path, audio_stream_index, mix, centre, left, right,
-                                                     probe_at, probe_at + PROBE_MS);
-            std::vector<float> got = analyse(part, silero);
-            if (got.empty() && silero) got = analyse(part, false);
-            double score = profile_score(got);
-            const char* name = (mix == 0) ? "centre" : (mix == 2 ? "front pair" : "downmix");
-            say() << "Mix " << name << ": score=" << score << '\n';
-            if (score > best) { best = score; winner = mix; }
+        for (size_t m = 0; m < mixes.size(); m++) {
+            const char* name = (mixes[m] == 0) ? "centre" : (mixes[m] == 2 ? "front pair" : "downmix");
+            say() << "Mix " << name << ": score=" << scores[m] << '\n';
+            if (scores[m] > best) { best = scores[m]; winner = mixes[m]; }
         }
     }
 

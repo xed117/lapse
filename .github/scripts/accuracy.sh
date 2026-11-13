@@ -137,11 +137,30 @@ check "runs late"             plain.mkv  shifted.srt truth.srt
 
 echo "== files joined out of parts"
 check "a part was cut out"    joined.mkv concat_gap.srt concat_truth.srt
+check "a long part was cut out" joined.mkv concat_long.srt concat_truth.srt
+check "two parts were cut out"  joined.mkv concat_three.srt concat_truth.srt
+check "a short part far out"  joined.mkv concat_far.srt concat_truth.srt split
 check "subtitle restarts"     joined.mkv concat_ep.srt  concat_truth.srt
+
+echo "== drift with a cut in it"
+check "drift and a cut"       joined.mkv drift_cut.srt  concat_truth.srt
+check "drift and a long cut"  joined.mkv drift_long.srt concat_truth.srt
 
 echo "== modes"
 check "nosplit"               plain.mkv  shifted.srt truth.srt nosplit
 check "split"                 plain.mkv  shifted.srt truth.srt split
+
+echo "== a VobSub against a subtitle"
+cp vobsub.idx work.idx
+cp vobsub.sub work.sub
+"$LAPSE" steady.srt work.idx --force --no-backup > /dev/null 2>&1 || true
+worst=$(python3 "$HERE/compare-srt.py" work.idx steady_part.srt)
+if [ "$worst" -gt "$TOLERANCE" ]; then
+    printf "  %-28s FAIL worst cue off by %sms\n" "pictures near the end" "$worst"
+    fails=$((fails + 1))
+else
+    printf "  %-28s ok   (worst %sms)\n" "pictures near the end" "$worst"
+fi
 
 echo "== knows when it does not know"
 refuses "a different film"    joined.mkv unrelated.srt
