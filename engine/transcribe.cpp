@@ -62,7 +62,7 @@ std::vector<int> spoken_words(const std::string& wav, const std::string& model, 
     // -dtw joins the command only when the caller set it, in its usual place, quoted like every other path.
     const bool dtw_on = dtw && !dtw->empty();
     std::string command = in_quotes(cli ? cli : "whisper-cli") + " -m " + in_quotes(model) + " -f " + in_quotes(wav) +
-        " -ojf -of " + in_quotes(out) + dtw_argument(dtw) + " -nfa -np -t " + std::to_string(threads) +
+        " -ojf -of " + in_quotes(out) + dtw_argument(dtw) + " -np -mc 0 -t " + std::to_string(threads) +
         " -l " + in_quotes(language);
 #ifdef _WIN32
     command = "\"" + command + " > NUL 2>&1\"";
