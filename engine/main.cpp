@@ -22,6 +22,8 @@
 #include <sstream>
 #include <filesystem>
 #include <climits>
+#include <cctype>
+#include <optional>
 #ifdef _WIN32
     #define WIN32_LEAN_AND_MEAN
     #include <windows.h>
@@ -245,8 +247,35 @@ static void save_spans(const std::filesystem::path& path, const std::vector<std:
 
 
 static const double SURE_SIGMA = 8.0;
-static std::vector<int> heard_words(const std::string& video, int stream, const std::filesystem::path& cache, const std::string& model) {
-    std::filesystem::path saved = cache.empty() ? cache : std::filesystem::path(cache.string() + "." + std::filesystem::path(model).stem().string() + ".words");
+
+// True when a bare token right after --whisper's model looks like an ISO language code (en, ja, zh, zh-Hans...)
+// rather than another positional argument. Letters and single hyphens only, and never a mode word, so we do not
+// swallow "auto"/"split"/etc. that belong to the positional mode slot.
+static bool looks_like_language(const std::string& s) {
+    if (s.size() < 2 || s.size() > 8) return false;
+    if (s.front() == '-' || s.back() == '-') return false;
+    bool prev_dash = false;
+    std::string low;
+    for (char c : s) {
+        if (c == '-') {
+            if (prev_dash) return false;
+            prev_dash = true;
+            continue;
+        }
+        if (!isalpha((unsigned char)c)) return false;
+        prev_dash = false;
+        low += (char)tolower((unsigned char)c);
+    }
+    static const char* modes[] = {"auto", "ols", "nosplit", "split"};
+    for (const char* m : modes)
+        if (low == m) return false;
+    return true;
+}
+
+static std::vector<int> heard_words(const std::string& video, int stream, const std::filesystem::path& cache, const std::string& model, const std::optional<std::string>& lang) {
+    // The language changes which words whisper hears, so keep one cache file per language.
+    std::filesystem::path saved = cache.empty() ? cache : std::filesystem::path(cache.string() + "." + std::filesystem::path(model).stem().string() +
+        (lang && !lang->empty() ? "." + *lang : std::string()) + ".words");
     std::vector<int> words;
     std::ifstream in(saved);
     int w;
@@ -255,7 +284,7 @@ static std::vector<int> heard_words(const std::string& video, int stream, const 
 
     std::error_code ec;
     std::string wav = (std::filesystem::temp_directory_path() / ("lapse-" + std::to_string(std::hash<std::string>()(video)) + ".wav")).string();
-    if (audio_to_wav(video.c_str(), stream, wav)) words = spoken_words(wav, model);
+    if (audio_to_wav(video.c_str(), stream, wav)) words = spoken_words(wav, model, lang);
     std::filesystem::remove(wav, ec);
 
     if (!saved.empty() && !words.empty()) {
@@ -506,13 +535,13 @@ static void report(const Report& r) {
 }
 
 void usage() {
-    std::cerr << "Usage: lapse <video_or_subtitle> [subtitle] [auto|ols|nosplit|split] [penalty] [--output <path>] [--no-backup] [--no-sidecar] [--no-embedded] [--full-scan] [--no-cache] [--force] [--json] [--quiet] [--dry-run] [--strict] [--confidence N] [--audio-track N] [--sub-track N] [--fps N] [--snap [ms]] [--encoding NAME] [--from video] [--min-shift ms] [--whisper model]\n";
+    std::cerr << "Usage: lapse <video_or_subtitle> [subtitle] [auto|ols|nosplit|split] [penalty] [--output <path>] [--no-backup] [--no-sidecar] [--no-embedded] [--full-scan] [--no-cache] [--force] [--json] [--quiet] [--dry-run] [--strict] [--confidence N] [--audio-track N] [--sub-track N] [--fps N] [--snap [ms]] [--encoding NAME] [--from video] [--min-shift ms] [--whisper model [lang]]\n";
     std::cerr << "       --confidence N   how far the answer has to stand out before the original is overwritten (default " << sure_sigma << ")\n";
     std::cerr << "       --encoding NAME  write the result as utf8, utf8-bom, utf16le, utf16be or latin1 instead of whatever came in\n";
     std::cerr << "       --snap [ms]      pull a cue start onto the picture cut it lands next to, within ms (default " << SNAP_WINDOW_MS << ")\n";
     std::cerr << "       --from video     the subtitle is in sync with this video, move it to the first one by their sound\n";
     std::cerr << "       --min-shift ms   leave the file alone when nothing in it would move by this much\n";
-    std::cerr << "       --whisper model  only trust speech whisper-cli hears words in, model is a ggml file like ggml-base.en.bin\n";
+    std::cerr << "       --whisper model [lang]  only trust speech whisper-cli hears words in, model is a ggml file like ggml-base.en.bin, lang is an optional language code like en or ja (default: en for .en models, auto otherwise)\n";
     std::cerr << "       lapse --version\n";
     std::cerr << "       lapse --formats\n";
     std::cerr << "       lapse --vad\n";
@@ -591,6 +620,7 @@ int run(int argc, const char *argv[]) {
     std::string from_video;
     int min_shift = 1;
     std::string whisper_model;
+    std::optional<std::string> whisper_lang;
     double fps = 0;
     double shift_ms = 0;
     bool shifting = false;
@@ -684,6 +714,10 @@ int run(int argc, const char *argv[]) {
         } else if (arg == "--whisper") {
             if (i + 1 >= argc) { usage(); return -1; }
             whisper_model = argv[++i];
+            // An optional language code may follow the model, e.g. --whisper ggml-large-v3.bin ja.
+            // Only consume it when it really looks like a code so the positional slots keep working.
+            if (i + 1 < argc && looks_like_language(argv[i + 1]))
+                whisper_lang = argv[++i];
         } else if (arg == "--shift") {
             if (i + 1 >= argc || !number(argv[++i], shift_ms) || std::fabs(shift_ms) > MAX_TIME_MS) {
                 std::cerr << "--shift wants a number of ms\n";
@@ -902,7 +936,7 @@ int run(int argc, const char *argv[]) {
 
     std::vector<int> words;
     if (!whisper_model.empty() && !is_subtitle(ref_path) && !ref_weights.empty()) {
-        words = heard_words(ref_path, find_audio_stream(AVC, audio_track), cache, whisper_model);
+        words = heard_words(ref_path, find_audio_stream(AVC, audio_track), cache, whisper_model, whisper_lang);
         if (words.size() < 50) {
             say() << "Whisper heard " << words.size() << " words, too few to go on, using all the speech\n";
             words.clear();

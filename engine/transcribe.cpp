@@ -54,7 +54,7 @@ static std::string preset(const std::string& model) {
     return "";
 }
 
-std::vector<int> spoken_words(const std::string& wav, const std::string& model) {
+std::vector<int> spoken_words(const std::string& wav, const std::string& model, std::optional<std::string> lang) {
     std::string dtw = preset(model);
     if (dtw.empty()) {
         std::cerr << "Cannot tell which whisper model " << model << " is from its name, it should look like ggml-base.en.bin\n";
@@ -66,9 +66,14 @@ std::vector<int> spoken_words(const std::string& wav, const std::string& model) 
     std::string out = (std::filesystem::temp_directory_path() /
         ("lapse-words-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()))).string();
 
+    // A language the caller named wins; otherwise keep the old guess of "en" for a .en preset and "auto" for the rest.
+    std::string language = (lang && !lang->empty())
+        ? *lang
+        : (dtw.size() > 3 && dtw.compare(dtw.size() - 3, 3, ".en") == 0 ? "en" : "auto");
+
     std::string command = in_quotes(cli ? cli : "whisper-cli") + " -m " + in_quotes(model) + " -f " + in_quotes(wav) +
         " -ojf -of " + in_quotes(out) + " -dtw " + dtw + " -nfa -np -t " + std::to_string(threads) +
-        " -l " + (dtw.size() > 3 && dtw.compare(dtw.size() - 3, 3, ".en") == 0 ? "en" : "auto");
+        " -l " + in_quotes(language);
 #ifdef _WIN32
     command = "\"" + command + " > NUL 2>&1\"";
 #else

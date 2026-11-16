@@ -14,7 +14,10 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 #pragma once
+#include <optional>
 #include <string>
 #include <vector>
 
-std::vector<int> spoken_words(const std::string& wav, const std::string& model);
+// lang: an ISO language code the caller wants whisper-cli to force with -l.
+// When it is empty we fall back to "en" for a .en dtw preset and "auto" otherwise.
+std::vector<int> spoken_words(const std::string& wav, const std::string& model, std::optional<std::string> lang = std::nullopt);
