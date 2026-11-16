@@ -186,6 +186,7 @@ The options can go anywhere on the line.
 | `--snap [ms]` | Move line starts and ends onto picture cuts close by. Default 120 ms |
 | `--from <video>` | The subtitle fits this video. Move it to the first one by their sound |
 | `--whisper <model>` | Only trust the speech whisper.cpp hears words in |
+| `--dtw <preset>` | With `--whisper`, sharpen word timestamps with DTW, `base.en`, `large.v3.turbo` and so on (default off) |
 | `--json` | Print one line of JSON on stdout and everything else on stderr |
 | `--quiet` | Print only errors |
 
@@ -295,7 +296,13 @@ The speech detector hears voices. It cannot tell whether a voice is saying anyth
 ./lapse video.mkv subtitles.srt --whisper ~/models/ggml-base.en.bin
 ```
 
-whisper.cpp is not included. LAPSE runs `whisper-cli` from the `PATH`, or wherever `LAPSE_WHISPER_CLI` points. The model is any ggml file from the whisper.cpp project, with the name they gave it, so LAPSE can tell which one it is. `ggml-base.en.bin` is plenty for English and `ggml-base.bin` for other languages. The words are cached with the speech, so only the first run on a film pays for the transcription. That is about two minutes for a two hour film on a recent laptop, and a lot longer on a small server without a GPU.
+whisper.cpp is not included. LAPSE runs `whisper-cli` from the `PATH`, or wherever `LAPSE_WHISPER_CLI` points. The model is any ggml file from the whisper.cpp project. `ggml-base.en.bin` is plenty for English and `ggml-base.bin` for other languages. The words are cached with the speech, so only the first run on a film pays for the transcription. That is about two minutes for a two hour film on a recent laptop, and a lot longer on a small server without a GPU.
+
+`--dtw` is off unless you ask for it, and it is all that decides whether whisper.cpp runs its dynamic time warping pass: with it, LAPSE appends `-dtw <preset>` to the whisper-cli command, without it nothing is appended at all. The value is one of whisper.cpp's own DTW preset names (`tiny.en`, `base.en`, `large-v3` is `large.v3`, and so on) and should match the `--whisper` model, since the preset picks the alignment heads. It makes each word's moment a little tighter:
+
+```bash
+./lapse video.mkv subtitles.srt --whisper ~/models/ggml-base.en.bin --dtw base.en
+```
 
 The timing of each line still comes from the speech detector. Whisper only decides which speech counts, so a good answer does not move. It stands out more on a busy soundtrack: with music under the speech at the same level, sigma went from 18 to 19. It is off unless you ask for it, and when `whisper-cli` cannot be found or hears fewer than 50 words, LAPSE says so and uses all the speech.
 
@@ -435,6 +442,7 @@ Every option the command line takes is available in the container. Switches are 
 | `MIN_SHIFT` | `--min-shift` | Leave a subtitle alone when nothing in it would move by this many milliseconds |
 | `ENCODING` | `--encoding` | Write every result as `utf8`, `utf8-bom`, `utf16le`, `utf16be` or `latin1`. Empty keeps the encoding each file came in |
 | `WHISPER` | `--whisper` | Path inside the container to a whisper.cpp model such as `ggml-base.en.bin`. Needs `whisper-cli` mounted in too, see [Listening for words](#listening-for-words) |
+| `DTW` | `--dtw` | A whisper.cpp DTW preset name such as `base.en` that turns on dynamic time warping for the word timestamps. Empty leaves `-dtw` out of the command entirely, see [Listening for words](#listening-for-words) |
 
 All of these are also under Settings in the web interface, and what you save there is used from the next scan on. `OUTPUT_SUFFIX` and `NO_BACKUP` together make the file output choice there:
 

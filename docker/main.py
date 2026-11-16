@@ -67,6 +67,7 @@ VALUES = [
     ("ENCODING", "--encoding"),
     ("MIN_SHIFT", "--min-shift"),
     ("WHISPER", "--whisper"),
+    ("DTW", "--dtw"),
 ]
 
 VIDEO_EXTS = {

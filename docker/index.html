@@ -321,6 +321,8 @@ matchMedia("(prefers-color-scheme: dark)").onchange = paintTheme;
           </select>
           <label class="inline" for="whisper">Whisper model</label>
           <input type="text" id="whisper" placeholder="off" style="width: 220px">
+          <label class="inline" for="dtw">Whisper DTW</label>
+          <input type="text" id="dtw" placeholder="off" style="width: 140px">
         </div>
         <div class="switches">
           <label><input type="checkbox" id="force"><span>Sync even when there is little to go on</span></label>
@@ -621,6 +623,7 @@ function drawEngine() {
   SWITCHES.forEach(name => $(name).checked = !!engine[name]);
   $("encoding").value = engine.encoding || "";
   $("whisper").value = engine.whisper || "";
+  $("dtw").value = engine.dtw || "";
   showSuffix();
 }
 
@@ -739,6 +742,7 @@ $("saveEngine").onclick = () => {
   SWITCHES.forEach(name => engine[name] = $(name).checked);
   engine.encoding = $("encoding").value;
   engine.whisper = $("whisper").value.trim();
+  engine.dtw = $("dtw").value.trim();
   send("/api/engine", { engine });
 };
 

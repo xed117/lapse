@@ -19,5 +19,12 @@
 #include <vector>
 
 // lang: an ISO language code the caller wants whisper-cli to force with -l.
-// When it is empty we fall back to "en" for a .en dtw preset and "auto" otherwise.
-std::vector<int> spoken_words(const std::string& wav, const std::string& model, std::optional<std::string> lang = std::nullopt);
+// When it is empty we fall back to "en" for an English-only model and "auto" otherwise.
+//
+// dtw: the whisper-cli DTW preset name (tiny, base.en, large.v3.turbo, ...) that
+// enables dynamic time warping for tighter word timestamps. It is passed through
+// to whisper-cli verbatim as -dtw <value>. When it is nullopt or empty, DTW is
+// off and whisper-cli is run without -dtw at all.
+std::vector<int> spoken_words(const std::string& wav, const std::string& model,
+                              std::optional<std::string> lang = std::nullopt,
+                              std::optional<std::string> dtw = std::nullopt);

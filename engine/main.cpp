@@ -272,10 +272,10 @@ static bool looks_like_language(const std::string& s) {
     return true;
 }
 
-static std::vector<int> heard_words(const std::string& video, int stream, const std::filesystem::path& cache, const std::string& model, const std::optional<std::string>& lang) {
-    // The language changes which words whisper hears, so keep one cache file per language.
+static std::vector<int> heard_words(const std::string& video, int stream, const std::filesystem::path& cache, const std::string& model, const std::optional<std::string>& lang, const std::optional<std::string>& dtw) {
+    // The language changes which words whisper hears and dtw the timestamps it gives them, so both join the cache key.
     std::filesystem::path saved = cache.empty() ? cache : std::filesystem::path(cache.string() + "." + std::filesystem::path(model).stem().string() +
-        (lang && !lang->empty() ? "." + *lang : std::string()) + ".words");
+        (lang && !lang->empty() ? "." + *lang : std::string()) + (dtw && !dtw->empty() ? "." + *dtw : std::string()) + ".words");
     std::vector<int> words;
     std::ifstream in(saved);
     int w;
@@ -284,7 +284,7 @@ static std::vector<int> heard_words(const std::string& video, int stream, const 
 
     std::error_code ec;
     std::string wav = (std::filesystem::temp_directory_path() / ("lapse-" + std::to_string(std::hash<std::string>()(video)) + ".wav")).string();
-    if (audio_to_wav(video.c_str(), stream, wav)) words = spoken_words(wav, model, lang);
+    if (audio_to_wav(video.c_str(), stream, wav)) words = spoken_words(wav, model, lang, dtw);
     std::filesystem::remove(wav, ec);
 
     if (!saved.empty() && !words.empty()) {
@@ -535,13 +535,14 @@ static void report(const Report& r) {
 }
 
 void usage() {
-    std::cerr << "Usage: lapse <video_or_subtitle> [subtitle] [auto|ols|nosplit|split] [penalty] [--output <path>] [--no-backup] [--no-sidecar] [--no-embedded] [--full-scan] [--no-cache] [--force] [--json] [--quiet] [--dry-run] [--strict] [--confidence N] [--audio-track N] [--sub-track N] [--fps N] [--snap [ms]] [--encoding NAME] [--from video] [--min-shift ms] [--whisper model [lang]]\n";
+    std::cerr << "Usage: lapse <video_or_subtitle> [subtitle] [auto|ols|nosplit|split] [penalty] [--output <path>] [--no-backup] [--no-sidecar] [--no-embedded] [--full-scan] [--no-cache] [--force] [--json] [--quiet] [--dry-run] [--strict] [--confidence N] [--audio-track N] [--sub-track N] [--fps N] [--snap [ms]] [--encoding NAME] [--from video] [--min-shift ms] [--whisper model [lang]] [--dtw preset]\n";
     std::cerr << "       --confidence N   how far the answer has to stand out before the original is overwritten (default " << sure_sigma << ")\n";
     std::cerr << "       --encoding NAME  write the result as utf8, utf8-bom, utf16le, utf16be or latin1 instead of whatever came in\n";
     std::cerr << "       --snap [ms]      pull a cue start onto the picture cut it lands next to, within ms (default " << SNAP_WINDOW_MS << ")\n";
     std::cerr << "       --from video     the subtitle is in sync with this video, move it to the first one by their sound\n";
     std::cerr << "       --min-shift ms   leave the file alone when nothing in it would move by this much\n";
     std::cerr << "       --whisper model [lang]  only trust speech whisper-cli hears words in, model is a ggml file like ggml-base.en.bin, lang is an optional language code like en or ja (default: en for .en models, auto otherwise)\n";
+    std::cerr << "       --dtw preset        sharpen whisper's word timestamps with dynamic time warping, preset is a whisper.cpp DTW name like base.en or large.v3.turbo, it must match your --whisper model (default: off, no -dtw is given to whisper-cli)\n";
     std::cerr << "       lapse --version\n";
     std::cerr << "       lapse --formats\n";
     std::cerr << "       lapse --vad\n";
@@ -621,6 +622,7 @@ int run(int argc, const char *argv[]) {
     int min_shift = 1;
     std::string whisper_model;
     std::optional<std::string> whisper_lang;
+    std::optional<std::string> whisper_dtw;
     double fps = 0;
     double shift_ms = 0;
     bool shifting = false;
@@ -718,6 +720,9 @@ int run(int argc, const char *argv[]) {
             // Only consume it when it really looks like a code so the positional slots keep working.
             if (i + 1 < argc && looks_like_language(argv[i + 1]))
                 whisper_lang = argv[++i];
+        } else if (arg == "--dtw") {
+            if (i + 1 >= argc) { usage(); return -1; }
+            whisper_dtw = argv[++i];
         } else if (arg == "--shift") {
             if (i + 1 >= argc || !number(argv[++i], shift_ms) || std::fabs(shift_ms) > MAX_TIME_MS) {
                 std::cerr << "--shift wants a number of ms\n";
@@ -936,7 +941,7 @@ int run(int argc, const char *argv[]) {
 
     std::vector<int> words;
     if (!whisper_model.empty() && !is_subtitle(ref_path) && !ref_weights.empty()) {
-        words = heard_words(ref_path, find_audio_stream(AVC, audio_track), cache, whisper_model, whisper_lang);
+        words = heard_words(ref_path, find_audio_stream(AVC, audio_track), cache, whisper_model, whisper_lang, whisper_dtw);
         if (words.size() < 50) {
             say() << "Whisper heard " << words.size() << " words, too few to go on, using all the speech\n";
             words.clear();
