@@ -174,11 +174,25 @@ static bool has_provider(const std::vector<std::string>& names, const char* want
     return std::find(names.begin(), names.end(), want) != names.end();
 }
 
+// Where a compiled TensorRT engine is kept. Next to the model normally, or wherever
+// LAPSE_VAD_TRT_CACHE points. Failing to make the directory is not fatal, the
+// provider then just rebuilds the engine at every run instead of reusing one.
+static std::string trt_cache_dir(const std::filesystem::path& model) {
+    const char* forced = std::getenv("LAPSE_VAD_TRT_CACHE");
+    std::filesystem::path dir = forced ? std::filesystem::path(forced)
+                                       : model.parent_path() / "trt_cache";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return ec ? std::string(".") : dir.string();
+}
+
 // Bolts one execution provider onto a fresh set of session options. An empty name
-// means plain CPU. CUDA goes through the V2 path so we can cap its memory footprint
-// and pick a low-latency conv algorithm; everything else (DirectML) uses the generic
-// by-name call. Returns false when the provider cannot be attached.
-static bool append_provider(OrtSessionOptions* opts, const std::string& provider) {
+// means plain CPU. CUDA and TensorRT go through their V2 option objects so CUDA can
+// cap its memory footprint and TensorRT can be told where to cache its compiled
+// engines; everything else (DirectML) uses the generic by-name call. Returns false
+// when the provider cannot be attached.
+static bool append_provider(OrtSessionOptions* opts, const std::string& provider,
+                            const std::filesystem::path& model) {
     if (provider.empty()) return true;
 
     if (provider == "CUDA") {
@@ -202,6 +216,26 @@ static bool append_provider(OrtSessionOptions* opts, const std::string& provider
         return good;
     }
 
+    if (provider == "TensorRT") {
+        OrtTensorRTProviderOptionsV2* trt = nullptr;
+        if (!ok(ort->CreateTensorRTProviderOptions(&trt)) || !trt) return false;
+
+        // TensorRT compiles the graph for this exact GPU while the session opens,
+        // which for a model this small costs more than the inference of many films
+        // put together, so the engine is cached and reused from then on. The cache
+        // is keyed to the model, the TensorRT build and the GPU, so an entry that
+        // has gone stale under one of them is simply rebuilt.
+        std::string device = std::to_string(cuda_device);
+        std::string cache = trt_cache_dir(model);
+        const char* keys[] = {"device_id", "trt_engine_cache_enable", "trt_engine_cache_path", "trt_timing_cache_enable"};
+        const char* values[] = {device.c_str(), "1", cache.c_str(), "1"};
+
+        bool good = ok(ort->UpdateTensorRTProviderOptions(trt, keys, values, 4));
+        if (good) good = ok(ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(opts, trt));
+        ort->ReleaseTensorRTProviderOptions(trt);
+        return good;
+    }
+
     return ok(ort->SessionOptionsAppendExecutionProvider(opts, provider.c_str(), nullptr, nullptr, 0));
 }
 
@@ -213,7 +247,7 @@ static bool build_session(const std::filesystem::path& model, const std::string&
     ort->SetInterOpNumThreads(options, 1);
     ort->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL);
 
-    if (!append_provider(options, provider)) {
+    if (!append_provider(options, provider, model)) {
         ort->ReleaseSessionOptions(options);
         options = nullptr;
         return false;
@@ -323,9 +357,17 @@ bool silero_open() {
     // Prefer a GPU execution provider when this onnxruntime build ships one, but let
     // LAPSE_VAD_CPU pin it back to the CPU. CUDA first, DirectML only on Windows where
     // it is a real provider, and the CPU provider always last as the sure thing.
+    //
+    // TensorRT stays opt-in behind LAPSE_VAD_TRT even when the runtime advertises it.
+    // For a 512-sample stateful update its compiled engine is no faster than CUDA,
+    // while building it costs seconds on first use and the TensorRT runtime is many
+    // times the size of this program. When the flag is set it still goes in front of
+    // CUDA, and the probe below catches an engine that fails to build or run so the
+    // chain keeps falling through to it.
     std::vector<std::string> available = list_providers();
     std::vector<std::string> order;
     if (!std::getenv("LAPSE_VAD_CPU")) {
+        if (std::getenv("LAPSE_VAD_TRT") && has_provider(available, "TensorRT")) order.push_back("TensorRT");
         if (has_provider(available, "CUDA")) order.push_back("CUDA");
 #ifdef _WIN32
         if (has_provider(available, "DML")) order.push_back("DML");
