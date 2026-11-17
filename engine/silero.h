@@ -27,9 +27,28 @@ void silero_close();
 // overhead is most of the cost, so a film gets cut into lanes and they all walk
 // forward together. silero_begin returns how many lanes it actually got
 #include <vector>
+
+struct Lanes;
+
+// Frees whatever silero_begin bolted onto the run. The destructor does it, so
+// callers never have to; it is public because Lanes lives in headers that must
+// not see what the device fast path actually is.
+void silero_end(Lanes& run);
+
 struct Lanes {
     int count = 0;
     std::vector<float> state, context, window;
+    // Opaque handle on the device-side plumbing (pinned staging, one IoBinding,
+    // a recurrent state that never leaves the GPU). Owned by the run, freed by
+    // the destructor, null on the plain path.
+    void* fast = nullptr;
+
+    Lanes() = default;
+    ~Lanes() { silero_end(*this); }
+    // The fast path cannot be copied, only owned. Nothing in the engine copies
+    // a run today; this keeps anyone who tries honest.
+    Lanes(const Lanes&) = delete;
+    Lanes& operator=(const Lanes&) = delete;
 };
 
 int silero_begin(Lanes& run, int lanes);

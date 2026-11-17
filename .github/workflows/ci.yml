@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
 
 env:
-  ORT_VERSION: 1.28.0
+  ORT_VERSION: 1.32.0
 
 jobs:
   unix:

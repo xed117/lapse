@@ -29,7 +29,7 @@ RUN cmake -B build && \
     cmake --build build -j "$(nproc)" && \
     cp build/lapse /lapse
 
-ARG ORT_VERSION=1.28.0
+ARG ORT_VERSION=1.32.0
 ARG SILERO_TAG=v6.2.1
 ARG SILERO_SHA=1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3
 RUN set -eux; \

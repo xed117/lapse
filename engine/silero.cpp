@@ -23,6 +23,7 @@
     typedef HMODULE library_handle;
 #else
     #include <dlfcn.h>
+    #include <sys/mman.h>
     typedef void* library_handle;
 #endif
 
@@ -34,9 +35,11 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <chrono>
 #include <string>
+#include <new>
 
 static library_handle library = nullptr;
 static const OrtApi* ort = nullptr;
@@ -66,6 +69,104 @@ static bool ok(OrtStatus* status) {
     std::cerr << "onnxruntime: " << ort->GetErrorMessage(status) << '\n';
     ort->ReleaseStatus(status);
     return false;
+}
+
+// Page-locked host memory without linking the CUDA runtime. The driver treats
+// locked pages as pinned, so the copy paths DMA them straight instead of
+// staging through a bounce buffer of their own, which is what turns the per
+// step host-to-device transfer from a synchronous copy into a real one.
+// Windows locks a committed region, POSIX mlocks the mapping; both round up
+// to a page so unlocking covers exactly what was locked.
+static void* pin_alloc(size_t bytes) {
+    size_t pages = (bytes + 4095) & ~(size_t)4095;
+#ifdef _WIN32
+    void* p = VirtualAlloc(nullptr, pages, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!p) return nullptr;
+    if (!VirtualLock(p, pages)) {
+        VirtualFree(p, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return p;
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 4096, pages) != 0) return nullptr;
+    if (mlock(p, pages) != 0) {
+        free(p);
+        return nullptr;
+    }
+    return p;
+#endif
+}
+
+static void pin_free(void* p, size_t bytes) {
+    if (!p) return;
+    size_t pages = (bytes + 4095) & ~(size_t)4095;
+#ifdef _WIN32
+    VirtualUnlock(p, pages);
+    VirtualFree(p, 0, MEM_RELEASE);
+#else
+    munlock(p, pages);
+    free(p);
+#endif
+}
+
+// Everything a lane touches every step, parked once instead of rebuilt per
+// 32ms of audio. The window and the scores cross through page-locked staging;
+// the tensors that wrap them live as long as the run; and on CUDA the
+// recurrent state never comes back to the host at all - it ping-pongs between
+// two device buffers behind one IoBinding so no step ever reads and writes the
+// same buffer, and the only transfers left per step are the window in and the
+// scores out. Shapes are nailed down by silero_begin, so nothing needs
+// rebinding between steps except those two state slots.
+struct FastPath {
+    bool device_state = false;         // CUDA only: the state stays on the device
+    int active = 0;                    // which device buffer the last step wrote
+    bool pending_zero = true;          // the next step reads the zero state
+
+    size_t window_bytes = 0, score_bytes = 0, rate_bytes = 0, state_bytes = 0;
+
+    float* pin_window = nullptr;       // page-locked input staging
+    float* pin_score = nullptr;        // page-locked score output
+    int64_t* pin_rate = nullptr;       // page-locked sample rate, written once
+    float* pin_state_zero = nullptr;   // page-locked zeros, first step after a reset
+
+    OrtValue* v_window = nullptr;
+    OrtValue* v_sr = nullptr;
+    OrtValue* v_score = nullptr;
+    OrtValue* v_state_zero = nullptr;
+    OrtValue* v_state_host = nullptr;  // host mode: wraps run.state in place
+    OrtValue* v_dev_state[2] = {nullptr, nullptr};
+
+    OrtIoBinding* binding = nullptr;
+    OrtMemoryInfo* cuda_mem = nullptr;
+    OrtMemoryInfo* host_mem = nullptr;
+    OrtAllocator* gpu_alloc = nullptr;
+    float* dev_state[2] = {nullptr, nullptr};
+};
+
+static void fast_teardown(FastPath* fast) {
+    if (!fast) return;
+    if (ort) {
+        if (fast->binding) ort->ReleaseIoBinding(fast->binding);
+        if (fast->v_window) ort->ReleaseValue(fast->v_window);
+        if (fast->v_sr) ort->ReleaseValue(fast->v_sr);
+        if (fast->v_score) ort->ReleaseValue(fast->v_score);
+        if (fast->v_state_zero) ort->ReleaseValue(fast->v_state_zero);
+        if (fast->v_state_host) ort->ReleaseValue(fast->v_state_host);
+        for (OrtValue* value : fast->v_dev_state) if (value) ort->ReleaseValue(value);
+        if (fast->gpu_alloc) {
+            for (float* block : fast->dev_state)
+                if (block) ort->AllocatorFree(fast->gpu_alloc, block);
+            ort->ReleaseAllocator(fast->gpu_alloc);
+        }
+        if (fast->host_mem) ort->ReleaseMemoryInfo(fast->host_mem);
+        if (fast->cuda_mem) ort->ReleaseMemoryInfo(fast->cuda_mem);
+    }
+    pin_free(fast->pin_window, fast->window_bytes);
+    pin_free(fast->pin_score, fast->score_bytes);
+    pin_free(fast->pin_rate, fast->rate_bytes);
+    pin_free(fast->pin_state_zero, fast->state_bytes);
+    delete fast;
 }
 
 static std::filesystem::path binary_dir() {
@@ -366,6 +467,123 @@ static void maybe_benchmark() {
           << per_second << " windows/s\n";
 }
 
+// Bolts the device-side plumbing onto a run whose probe step already passed.
+// Locked staging, the tensors that wrap it, and on CUDA one IoBinding with the
+// state slots ping-ponging between two arena buffers, are all built once here
+// because nothing about a run's shapes changes after this point. LAPSE_VAD_NOFAST
+// skips the whole thing and leaves the run on the plain path, which is the A/B
+// baseline for LAPSE_VAD_BENCH. Any miss - locked memory denied, an old runtime
+// refusing a call, a provider that will not take a host output binding - drops
+// the attempt whole and the run keeps working the slow way.
+static FastPath* try_fast_path(Lanes& run) {
+    if (std::getenv("LAPSE_VAD_NOFAST")) return nullptr;
+
+    int lanes = run.count;
+    int width = SILERO_CONTEXT + SILERO_WINDOW;
+    FastPath* fast = new (std::nothrow) FastPath();
+    if (!fast) return nullptr;
+
+    fast->window_bytes = (size_t)lanes * width * sizeof(float);
+    fast->score_bytes = (size_t)lanes * sizeof(float);
+    fast->rate_bytes = sizeof(int64_t);
+    fast->state_bytes = (size_t)2 * lanes * 128 * sizeof(float);
+
+    fast->pin_window = (float*)pin_alloc(fast->window_bytes);
+    fast->pin_score = (float*)pin_alloc(fast->score_bytes);
+    fast->pin_rate = (int64_t*)pin_alloc(fast->rate_bytes);
+    fast->pin_state_zero = (float*)pin_alloc(fast->state_bytes);
+    if (!fast->pin_window || !fast->pin_score || !fast->pin_rate || !fast->pin_state_zero) {
+        fast_teardown(fast);
+        return nullptr;
+    }
+    std::memset(fast->pin_state_zero, 0, fast->state_bytes);
+    fast->pin_rate[0] = SILERO_RATE;
+
+    int64_t input_shape[2] = {lanes, width};
+    int64_t state_shape[3] = {2, lanes, 128};
+    int64_t score_shape[1] = {lanes};
+    int64_t scalar_shape[1] = {1};
+
+    bool built =
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_window, fast->window_bytes, input_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_window)) &&
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_rate, fast->rate_bytes, scalar_shape, 0, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &fast->v_sr)) &&
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_state_zero, fast->state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_zero));
+
+    if (built && provider_is(chosen_provider, "CUDA")) {
+        // The recurrent state is the one tensor of this model that only the
+        // model itself ever reads. On CUDA it does not need the host at all:
+        // two buffers in the provider's own arena swap roles every step, which
+        // takes both its transfers off the critical path.
+        built = built &&
+            ok(ort->CreateMemoryInfo("Cuda", OrtDeviceAllocator, cuda_device, OrtMemTypeDefault, &fast->cuda_mem)) &&
+            ok(ort->CreateAllocator(session, fast->cuda_mem, &fast->gpu_alloc));
+        for (int i = 0; built && i < 2; i++) {
+            fast->dev_state[i] = (float*)fast->gpu_alloc->Alloc(fast->gpu_alloc, fast->state_bytes);
+            built = fast->dev_state[i] != nullptr &&
+                ok(ort->CreateTensorWithDataAsOrtValue(fast->cuda_mem, fast->dev_state[i], fast->state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_dev_state[i]));
+        }
+        built = built &&
+            ok(ort->CreateMemoryInfo("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault, &fast->host_mem)) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(fast->host_mem, fast->pin_score, fast->score_bytes, score_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_score)) &&
+            ok(ort->CreateIoBinding(session, &fast->binding)) &&
+            ok(ort->BindInput(fast->binding, input_names[0], fast->v_window)) &&
+            ok(ort->BindInput(fast->binding, input_names[2], fast->v_sr)) &&
+            ok(ort->BindOutput(fast->binding, output_names[0], fast->v_score));
+        if (built) fast->device_state = true;
+    }
+
+    if (built && !fast->device_state) {
+        // Not CUDA (CPU or DirectML): the state stays where it lives, but it is
+        // wrapped once now so the per-step tensor churn goes away anyway.
+        built = ok(ort->CreateTensorWithDataAsOrtValue(memory, run.state.data(), run.state.size() * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_host));
+    }
+
+    if (!built) {
+        fast_teardown(fast);
+        return nullptr;
+    }
+    run.fast = fast;
+    return fast;
+}
+
+// CUDA with the state on the device: bind the two state slots for this step and
+// let one RunWithBinding carry everything else. The slot written last step is
+// the one read this step, and the one read this step is never the one being
+// written, so the buffers never alias even mid-flight on the stream. pending_zero
+// covers the first step after every reset, where the zeros are still on the host.
+static bool device_run(Lanes& run, FastPath& fast, float* out) {
+    int next = 1 - fast.active;
+    OrtValue* incoming = fast.pending_zero ? fast.v_state_zero : fast.v_dev_state[fast.active];
+    if (!ok(ort->BindInput(fast.binding, input_names[1], incoming))) return false;
+    if (!ok(ort->BindOutput(fast.binding, output_names[1], fast.v_dev_state[next]))) return false;
+    if (!ok(ort->RunWithBinding(session, nullptr, fast.binding))) return false;
+    for (int l = 0; l < run.count; l++) out[l] = fast.pin_score[l];
+    fast.active = next;
+    fast.pending_zero = false;
+    return true;
+}
+
+// Host state, persistent tensors: every provider that is not CUDA lands here,
+// and it is where CUDA would land if the device setup above had declined. Same
+// Run as the plain path, just with the input side wrapped once for good.
+static bool host_run(Lanes& run, FastPath& fast, float* out) {
+    OrtValue* in[3] = {fast.v_window, fast.v_state_host, fast.v_sr};
+    OrtValue* res[2] = {nullptr, nullptr};
+    bool done = false;
+    if (ok(ort->Run(session, nullptr, input_names, in, 3, output_names, 2, res))) {
+        float* score = nullptr;
+        float* next = nullptr;
+        if (ok(ort->GetTensorMutableData(res[0], (void**)&score)) &&
+            ok(ort->GetTensorMutableData(res[1], (void**)&next))) {
+            for (int l = 0; l < run.count; l++) out[l] = score[l];
+            std::copy(next, next + run.state.size(), run.state.begin());
+            done = true;
+        }
+    }
+    for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
+    return done;
+}
+
 bool silero_open() {
     std::lock_guard<std::mutex> guard(open_mutex);
     if (session) return true;
@@ -490,8 +708,17 @@ int silero_begin(Lanes& run, int lanes) {
     std::vector<float> probe(lanes * SILERO_WINDOW, 0.0f);
     std::vector<float> out(lanes, 0.0f);
     if (silero_step(run, probe.data(), out.data())) {
+        FastPath* fast = try_fast_path(run);
+        // A device binding that survives setup but chokes at Run time would
+        // fail the film, not just slow it, so spend one throwaway step proving
+        // the whole fast path before anyone commits to it.
+        if (fast && fast->device_state && !silero_step(run, probe.data(), out.data())) silero_end(run);
+
         run.state.assign(2 * lanes * 128, 0.0f);
         run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
+        // whatever the probe left in the device buffers is stale from here on;
+        // the next step reads the zeros again and overwrites a slot it never reads
+        if (run.fast) static_cast<FastPath*>(run.fast)->pending_zero = true;
         return lanes;
     }
 
@@ -508,47 +735,67 @@ bool silero_step(Lanes& run, const float* pcm, float* out) {
     std::vector<float>& context = run.context;
     std::vector<float>& window = run.window;
     int lane_count = run.count;
+    FastPath* fast = static_cast<FastPath*>(run.fast);
+
+    // The window goes through page-locked staging on the fast path and through
+    // the run's own vector otherwise; assembling it is the same loop either way.
+    float* stage = (fast && fast->pin_window) ? fast->pin_window : window.data();
 
     for (int l = 0; l < lane_count; l++) {
-        float* row = window.data() + (size_t)l * width;
+        float* row = stage + (size_t)l * width;
         std::copy(context.begin() + (size_t)l * SILERO_CONTEXT,
                   context.begin() + (size_t)(l + 1) * SILERO_CONTEXT, row);
         std::copy(pcm + (size_t)l * SILERO_WINDOW, pcm + (size_t)(l + 1) * SILERO_WINDOW, row + SILERO_CONTEXT);
     }
 
-    int64_t input_shape[2] = {lane_count, width};
-    int64_t state_shape[3] = {2, lane_count, 128};
-    int64_t scalar_shape[1] = {1};
-    int64_t rate = SILERO_RATE;
-
-    OrtValue* in[3] = {nullptr, nullptr, nullptr};
-    OrtValue* res[2] = {nullptr, nullptr};
     bool done = false;
+    if (fast) {
+        done = fast->device_state ? device_run(run, *fast, out) : host_run(run, *fast, out);
+    } else {
+        int64_t input_shape[2] = {lane_count, width};
+        int64_t state_shape[3] = {2, lane_count, 128};
+        int64_t scalar_shape[1] = {1};
+        int64_t rate = SILERO_RATE;
 
-    bool ready =
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, window.data(), window.size() * sizeof(float), input_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[0])) &&
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, state.data(), state.size() * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[1])) &&
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, &rate, sizeof(int64_t), scalar_shape, 0, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &in[2]));
+        OrtValue* in[3] = {nullptr, nullptr, nullptr};
+        OrtValue* res[2] = {nullptr, nullptr};
 
-    if (ready && ok(ort->Run(session, nullptr, input_names, in, 3, output_names, 2, res))) {
-        float* score = nullptr;
-        float* next = nullptr;
-        if (ok(ort->GetTensorMutableData(res[0], (void**)&score)) &&
-            ok(ort->GetTensorMutableData(res[1], (void**)&next))) {
-            for (int l = 0; l < lane_count; l++) {
-                out[l] = score[l];
-                const float* row = window.data() + (size_t)l * width;
-                std::copy(row + width - SILERO_CONTEXT, row + width,
-                          context.begin() + (size_t)l * SILERO_CONTEXT);
+        bool ready =
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, stage, window.size() * sizeof(float), input_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[0])) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, state.data(), state.size() * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[1])) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, &rate, sizeof(int64_t), scalar_shape, 0, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &in[2]));
+
+        if (ready && ok(ort->Run(session, nullptr, input_names, in, 3, output_names, 2, res))) {
+            float* score = nullptr;
+            float* next = nullptr;
+            if (ok(ort->GetTensorMutableData(res[0], (void**)&score)) &&
+                ok(ort->GetTensorMutableData(res[1], (void**)&next))) {
+                for (int l = 0; l < lane_count; l++) out[l] = score[l];
+                std::copy(next, next + state.size(), state.begin());
+                done = true;
             }
-            std::copy(next, next + state.size(), state.begin());
-            done = true;
         }
+
+        for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : in) if (value) ort->ReleaseValue(value);
     }
 
-    for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
-    for (OrtValue* value : in) if (value) ort->ReleaseValue(value);
-    return done;
+    if (!done) return false;
+
+    // the tail of the window just fed becomes the head of the next one
+    for (int l = 0; l < lane_count; l++) {
+        const float* row = stage + (size_t)l * width;
+        std::copy(row + width - SILERO_CONTEXT, row + width,
+                  context.begin() + (size_t)l * SILERO_CONTEXT);
+    }
+    return true;
+}
+
+void silero_end(Lanes& run) {
+    if (!run.fast) return;
+    FastPath* fast = static_cast<FastPath*>(run.fast);
+    run.fast = nullptr;
+    fast_teardown(fast);
 }
 
 void silero_close() {
