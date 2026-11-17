@@ -31,6 +31,7 @@
 #include <filesystem>
 #include <vector>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
@@ -158,7 +159,9 @@ static std::filesystem::path find_model() {
     return {};
 }
 
-// The names onnxruntime reports, e.g. "CUDA", "DML", "CPU". Empty when the call fails.
+// The names onnxruntime reports, e.g. "CUDAExecutionProvider", "CPUExecutionProvider".
+// Empty when the call fails. A provider whose shared library failed to load is simply
+// absent from this list, with no error of its own.
 static std::vector<std::string> list_providers() {
     std::vector<std::string> names;
     char** raw = nullptr;
@@ -170,8 +173,35 @@ static std::vector<std::string> list_providers() {
     return names;
 }
 
-static bool has_provider(const std::vector<std::string>& names, const char* want) {
-    return std::find(names.begin(), names.end(), want) != names.end();
+static std::string lower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return text;
+}
+
+// Compares a name onnxruntime reported against the short stem this file works with.
+// The runtime spells its providers "CUDAExecutionProvider", "DmlExecutionProvider"
+// and "TensorrtExecutionProvider", so comparing stems with the shared suffix and the
+// case set aside is what stops a spelling difference from silently leaving only the
+// CPU in the running. DirectML is spelled Dml, TensorRT is spelled Tensorrt.
+static bool provider_is(const std::string& name, const char* stem) {
+    std::string have = lower(name);
+    const std::string tail = "executionprovider";
+    if (have.size() > tail.size() &&
+        have.compare(have.size() - tail.size(), tail.size(), tail) == 0) {
+        have.erase(have.size() - tail.size());
+    }
+    return have == lower(stem);
+}
+
+// The name exactly as this onnxruntime spells it, "CUDAExecutionProvider" for "CUDA",
+// empty when it does not have one. The by-name append call has to be handed back the
+// spelling the runtime uses, so it is looked up rather than guessed at.
+static std::string provider_name(const std::vector<std::string>& names, const char* stem) {
+    for (const std::string& name : names) {
+        if (provider_is(name, stem)) return name;
+    }
+    return {};
 }
 
 // Where a compiled TensorRT engine is kept. Next to the model normally, or wherever
@@ -186,37 +216,66 @@ static std::string trt_cache_dir(const std::filesystem::path& model) {
     return ec ? std::string(".") : dir.string();
 }
 
+// One CUDA option at a time. When this onnxruntime does not recognise a key, or wants
+// a value in a form we did not guess, that one option is reported and skipped and the
+// rest still apply. Setting them all in a single call lets one option that changed
+// between releases fail the whole lot, and the GPU then goes back to the CPU.
+static void try_cuda_option(OrtCUDAProviderOptionsV2* cuda, const char* key, const std::string& value) {
+    const char* keys[] = {key};
+    const char* values[] = {value.c_str()};
+    OrtStatus* status = ort->UpdateCUDAProviderOptions(cuda, keys, values, 1);
+    if (!status) return;
+    say() << "Silero VAD: ignoring CUDA option " << key << "=" << value << ": "
+          << ort->GetErrorMessage(status) << "\n";
+    ort->ReleaseStatus(status);
+}
+
+// The TensorRT equivalent of the above.
+static void try_trt_option(OrtTensorRTProviderOptionsV2* trt, const char* key, const std::string& value) {
+    const char* keys[] = {key};
+    const char* values[] = {value.c_str()};
+    OrtStatus* status = ort->UpdateTensorRTProviderOptions(trt, keys, values, 1);
+    if (!status) return;
+    say() << "Silero VAD: ignoring TensorRT option " << key << "=" << value << ": "
+          << ort->GetErrorMessage(status) << "\n";
+    ort->ReleaseStatus(status);
+}
+
 // Bolts one execution provider onto a fresh set of session options. An empty name
 // means plain CPU. CUDA and TensorRT go through their V2 option objects so CUDA can
 // cap its memory footprint and TensorRT can be told where to cache its compiled
-// engines; everything else (DirectML) uses the generic by-name call. Returns false
-// when the provider cannot be attached.
+// engines; everything else (DirectML) uses the generic by-name call. The name handed
+// in is whatever this onnxruntime reported, matched by stem rather than spelled out
+// here. Returns false when the provider cannot be attached.
 static bool append_provider(OrtSessionOptions* opts, const std::string& provider,
                             const std::filesystem::path& model) {
     if (provider.empty()) return true;
 
-    if (provider == "CUDA") {
+    if (provider_is(provider, "CUDA")) {
         OrtCUDAProviderOptionsV2* cuda = nullptr;
         if (!ok(ort->CreateCUDAProviderOptions(&cuda)) || !cuda) return false;
 
-        // arena 1 = grow the same size as requested, so we do not squat on the whole
-        // card while whisper-cli and the decoder want room too. conv search 1 =
-        // heuristic, which skips the exhaustive autotune that would stall the first
-        // window. copy 1 = copies share the compute stream, which is what keeps the
-        // many threads calling Run() from racing on the transfer buffers.
+        // arena kSameAsRequested = grow by what was asked for instead of doubling, so
+        // we do not squat on the whole card while whisper-cli and the decoder want
+        // room too. conv search = the heuristic, which skips the exhaustive autotune
+        // that would stall the first window. Both of these are enums, and recent
+        // runtimes insist on the name and turn the old number down, so they are
+        // spelled out. copy in default stream = transfers share the compute stream,
+        // which is what keeps the many threads calling Run() from racing on them.
         std::string device = std::to_string(cuda_device);
         std::string limit = std::to_string(cuda_mem_bytes);
-        const char* keys[] = {"device_id", "gpu_mem_limit", "arena_extend_strategy",
-                              "cudnn_conv_algo_search", "do_copy_in_default_stream"};
-        const char* values[] = {device.c_str(), limit.c_str(), "1", "1", "1"};
+        try_cuda_option(cuda, "device_id", device);
+        try_cuda_option(cuda, "gpu_mem_limit", limit);
+        try_cuda_option(cuda, "arena_extend_strategy", "kSameAsRequested");
+        try_cuda_option(cuda, "cudnn_conv_algo_search", "HEURISTIC");
+        try_cuda_option(cuda, "do_copy_in_default_stream", "1");
 
-        bool good = ok(ort->UpdateCUDAProviderOptions(cuda, keys, values, 5));
-        if (good) good = ok(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cuda));
+        bool good = ok(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cuda));
         ort->ReleaseCUDAProviderOptions(cuda);
         return good;
     }
 
-    if (provider == "TensorRT") {
+    if (provider_is(provider, "TensorRT")) {
         OrtTensorRTProviderOptionsV2* trt = nullptr;
         if (!ok(ort->CreateTensorRTProviderOptions(&trt)) || !trt) return false;
 
@@ -224,14 +283,17 @@ static bool append_provider(OrtSessionOptions* opts, const std::string& provider
         // which for a model this small costs more than the inference of many films
         // put together, so the engine is cached and reused from then on. The cache
         // is keyed to the model, the TensorRT build and the GPU, so an entry that
-        // has gone stale under one of them is simply rebuilt.
+        // has gone stale under one of them is simply rebuilt. Asking for this
+        // provider is also what first loads the TensorRT runtime library, so a
+        // machine without one reports the missing nvinfer here and falls through.
         std::string device = std::to_string(cuda_device);
         std::string cache = trt_cache_dir(model);
-        const char* keys[] = {"device_id", "trt_engine_cache_enable", "trt_engine_cache_path", "trt_timing_cache_enable"};
-        const char* values[] = {device.c_str(), "1", cache.c_str(), "1"};
+        try_trt_option(trt, "device_id", device);
+        try_trt_option(trt, "trt_engine_cache_enable", "1");
+        try_trt_option(trt, "trt_engine_cache_path", cache);
+        try_trt_option(trt, "trt_timing_cache_enable", "1");
 
-        bool good = ok(ort->UpdateTensorRTProviderOptions(trt, keys, values, 4));
-        if (good) good = ok(ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(opts, trt));
+        bool good = ok(ort->SessionOptionsAppendExecutionProvider_TensorRT_V2(opts, trt));
         ort->ReleaseTensorRTProviderOptions(trt);
         return good;
     }
@@ -367,13 +429,29 @@ bool silero_open() {
     std::vector<std::string> available = list_providers();
     std::vector<std::string> order;
     if (!std::getenv("LAPSE_VAD_CPU")) {
-        if (std::getenv("LAPSE_VAD_TRT") && has_provider(available, "TensorRT")) order.push_back("TensorRT");
-        if (has_provider(available, "CUDA")) order.push_back("CUDA");
+        if (std::getenv("LAPSE_VAD_TRT")) {
+            std::string trt = provider_name(available, "TensorRT");
+            if (!trt.empty()) order.push_back(trt);
+        }
+        std::string cuda = provider_name(available, "CUDA");
+        if (!cuda.empty()) order.push_back(cuda);
 #ifdef _WIN32
-        if (has_provider(available, "DML")) order.push_back("DML");
+        std::string dml = provider_name(available, "Dml");
+        if (!dml.empty()) order.push_back(dml);
 #endif
     }
     order.push_back("");
+
+    // One line naming everything this onnxruntime offers. When the GPU providers are
+    // missing from it the reason is a DLL next to onnxruntime that failed to load,
+    // which is the single most common cause of a quiet fall back to the CPU, so it is
+    // worth having in the log even when nothing is wrong.
+    std::string reported;
+    for (const std::string& name : available) {
+        if (!reported.empty()) reported += ", ";
+        reported += name;
+    }
+    say() << "Silero VAD: onnxruntime offers " << (reported.empty() ? "nothing" : reported) << "\n";
 
     for (const std::string& provider : order) {
         if (build_session(model, provider) && validate_session()) {
