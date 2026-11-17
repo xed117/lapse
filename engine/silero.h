@@ -34,3 +34,8 @@ struct Lanes {
 
 int silero_begin(Lanes& run, int lanes);
 bool silero_step(Lanes& run, const float* lanes_pcm, float* out);
+
+// True once silero_open() has the session running on a GPU execution provider
+// (CUDA or DirectML). False means the CPU provider. Only meaningful after a
+// successful silero_open(); callers use it for logging and cache keys only.
+bool silero_on_gpu();

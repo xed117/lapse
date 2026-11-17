@@ -320,4 +320,8 @@ message(STATUS "lapse ${PROJECT_VERSION} (${lapse_build_note})")
 message(STATUS "  FFmpeg   ${LAPSE_FFMPEG_FROM}")
 message(STATUS "  FFTW3    ${LAPSE_FFTW3_FROM}")
 message(STATUS "  libfvad  ${LAPSE_FVAD_FROM}")
+# Silero VAD needs no build time dependency. onnxruntime and silero_vad.onnx are
+# dlopen'd at run time from beside the binary, and the GPU provider is whatever that
+# onnxruntime.dll was built with, so CUDA never shows up here. See LAPSE_VAD_BENCH.
+message(STATUS "  VAD      onnxruntime loaded at run time, CUDA used when the runtime has it")
 message(STATUS "")
