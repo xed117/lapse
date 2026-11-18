@@ -25,6 +25,9 @@ env:
 jobs:
   unix:
     name: ${{ matrix.name }}
+    # PAUSED: windows is the only target released for now.
+    # Delete this line to re-enable.
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -107,6 +110,9 @@ jobs:
 
   alpine:
     name: ${{ matrix.name }}
+    # PAUSED: windows is the only target released for now.
+    # Delete this line to re-enable.
+    if: false
     strategy:
       fail-fast: false
       matrix:
@@ -201,11 +207,17 @@ jobs:
           fi
 
       - name: Fetch onnxruntime and the Silero model
+        # PAUSED: onnxruntime and silero_vad.onnx are not shipped for now.
+        # Delete this line to re-enable.
+        if: false
         run: |
           .github/scripts/fetch-onnxruntime.sh \
             ${{ matrix.ort }} "${{ matrix.ort_version || env.ORT_VERSION }}" stage
 
       - name: Check Silero is picked up now it is there
+        # PAUSED: nothing is fetched above, so the binary falls back to libfvad.
+        # Delete this line to re-enable.
+        if: false
         run: |
           if [ "$(stage/lapse.exe --vad)" != "silero" ]; then
             echo "onnxruntime was shipped but the binary did not load it"
@@ -223,7 +235,9 @@ jobs:
           path: dist/*
 
   release:
-    needs: [unix, alpine, windows]
+    # PAUSED: unix and alpine are skipped, needs on a skipped job would skip this too.
+    # Restore to `needs: [unix, alpine, windows]` when they are re-enabled.
+    needs: [windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
