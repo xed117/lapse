@@ -24,6 +24,7 @@
 #else
     #include <dlfcn.h>
     #include <sys/mman.h>
+    #include <unistd.h>
     typedef void* library_handle;
 #endif
 
@@ -61,6 +62,18 @@ static long long cuda_mem_bytes = 512LL * 1024 * 1024;
 // The model wants the tail of the previous chunk glued to the front of this one. Without it the numbers come back near zero for speech that is plainly there
 static const int SILERO_CONTEXT = 64;
 
+// Every silero export this engine has met keeps its recurrent state as
+// [2, lanes, 128]. try_fast_path sizes and labels its buffers by what the
+// model declares instead; these are the fallback for a run whose model will
+// not declare itself, and what the plain path in silero_step feeds the
+// runtime, which accepts the silero convention it was exported for.
+static const int SILERO_STATE_DIRS = 2;
+static const int SILERO_STATE_HIDDEN = 128;
+
+// How deep the shape queries go before the model stops looking like anything
+// this engine speaks to. Silero's tensors are rank 1 to 3.
+static const size_t MAX_SHAPE_RANK = 4;
+
 static const char* input_names[]  = {"input", "state", "sr"};
 static const char* output_names[] = {"output", "stateN"};
 
@@ -75,10 +88,28 @@ static bool ok(OrtStatus* status) {
 // locked pages as pinned, so the copy paths DMA them straight instead of
 // staging through a bounce buffer of their own, which is what turns the per
 // step host-to-device transfer from a synchronous copy into a real one.
-// Windows locks a committed region, POSIX mlocks the mapping; both round up
-// to a page so unlocking covers exactly what was locked.
+// Windows locks a committed region, POSIX mlocks the mapping; both round the
+// request up to the page size the machine actually uses, asked of the kernel
+// rather than assumed, so unlocking covers exactly what was locked.
+static size_t page_bytes(void) {
+    static size_t page = 0;
+    if (page == 0) {
+#ifdef _WIN32
+        SYSTEM_INFO info;
+        GetSystemInfo(&info);
+        page = (size_t)info.dwPageSize;
+#else
+        long size = sysconf(_SC_PAGESIZE);
+        page = size > 0 ? (size_t)size : 4096;
+#endif
+    }
+    if (page < 4096) page = 4096;   // the pinned staging is DMA'd; small pages stay a bad idea
+    return page;
+}
+
 static void* pin_alloc(size_t bytes) {
-    size_t pages = (bytes + 4095) & ~(size_t)4095;
+    size_t page = page_bytes();
+    size_t pages = (bytes + page - 1) & ~(page - 1);
 #ifdef _WIN32
     void* p = VirtualAlloc(nullptr, pages, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!p) return nullptr;
@@ -89,7 +120,7 @@ static void* pin_alloc(size_t bytes) {
     return p;
 #else
     void* p = nullptr;
-    if (posix_memalign(&p, 4096, pages) != 0) return nullptr;
+    if (posix_memalign(&p, page, pages) != 0) return nullptr;
     if (mlock(p, pages) != 0) {
         free(p);
         return nullptr;
@@ -100,7 +131,8 @@ static void* pin_alloc(size_t bytes) {
 
 static void pin_free(void* p, size_t bytes) {
     if (!p) return;
-    size_t pages = (bytes + 4095) & ~(size_t)4095;
+    size_t page = page_bytes();
+    size_t pages = (bytes + page - 1) & ~(page - 1);
 #ifdef _WIN32
     VirtualUnlock(p, pages);
     VirtualFree(p, 0, MEM_RELEASE);
@@ -167,6 +199,128 @@ static void fast_teardown(FastPath* fast) {
     pin_free(fast->pin_rate, fast->rate_bytes);
     pin_free(fast->pin_state_zero, fast->state_bytes);
     delete fast;
+}
+
+// Everything the fast path needs to know about the model before it lays a
+// single buffer out, read from the session rather than assumed. The score has
+// been [lanes] for as long as the old exports but the v6 exports hand back
+// [lanes, 1]; nothing in this file should be the authority on what the model
+// looks like. try_fast_path only runs on a model that declared every tensor
+// this engine touches, in a shape and dtype the run can be sized by, because
+// a wrong guess is rejected at bind time at best and reads past the staging at
+// worst. Anything else returns false and the run keeps working through the
+// path where the runtime allocates its own everything.
+struct ModelProbe {
+    // dims are as declared until sized_dims runs, and carry the run's lane
+    // count substituted in after it.
+    int64_t window_dims[MAX_SHAPE_RANK]; size_t window_rank = 0; size_t window_elems = 0;
+    int64_t state_dims[MAX_SHAPE_RANK];  size_t state_rank = 0;  size_t state_elems = 0;
+    int64_t rate_dims[MAX_SHAPE_RANK];   size_t rate_rank = 0;
+    int64_t score_dims[MAX_SHAPE_RANK];  size_t score_rank = 0;  size_t score_elems = 0;
+};
+
+// Finds one named I/O of the live session and reports its element type and
+// dimensions. The names come from input_names/output_names, never an index.
+static bool shape_by_name(bool input, const char* name, ONNXTensorElementDataType& type,
+                          int64_t* dims, size_t& rank) {
+    OrtAllocator* allocator = nullptr;
+    if (!ok(ort->GetAllocatorWithDefaultOptions(&allocator)) || !allocator) return false;
+
+    size_t total = 0;
+    bool listed = input ? ok(ort->SessionGetInputCount(session, &total))
+                        : ok(ort->SessionGetOutputCount(session, &total));
+    if (!listed) return false;
+
+    for (size_t i = 0; i < total; i++) {
+        char* found = nullptr;
+        bool named = input ? ok(ort->SessionGetInputName(session, i, allocator, &found))
+                           : ok(ort->SessionGetOutputName(session, i, allocator, &found));
+        if (!named) break;
+        bool wanted = found && std::strcmp(found, name) == 0;
+        if (found) allocator->Free(allocator, found);
+        if (!wanted) continue;
+
+        OrtTypeInfo* type_info = nullptr;
+        bool typed = input ? ok(ort->SessionGetInputTypeInfo(session, i, &type_info))
+                           : ok(ort->SessionGetOutputTypeInfo(session, i, &type_info));
+        if (!typed) return false;
+
+        const OrtTensorTypeAndShapeInfo* info = nullptr;
+        bool got = ok(ort->CastTypeInfoToTensorInfo(type_info, &info)) && info != nullptr;
+        bool read = false;
+        if (got && ok(ort->GetTensorElementType(info, &type)) &&
+            ok(ort->GetDimensionsCount(info, &rank)) &&
+            rank >= 1 && rank <= MAX_SHAPE_RANK &&
+            ok(ort->GetDimensions(info, dims, rank)))
+            read = true;
+        ort->ReleaseTypeInfo(type_info);
+        return read;   // a name appears at most once in the I/O list
+    }
+    return false;
+}
+
+// Replaces the batch with the lane count this run carries. The batch is the
+// one axis the run sizes for itself - wherever the model left a dynamic axis
+// (-1, or the symbolic name that comes back as -2); a model with two of those
+// has an axis nobody can size buffers for. Concrete axes are kept as declared,
+// and the element count that comes back is what the caller sizes buffers by,
+// so a model whose batch was nailed to some other number fails the caller's
+// count checks instead of being force-fit into them.
+static bool sized_dims(int64_t* dims, size_t rank, int lanes, size_t& elems) {
+    elems = 1;
+    bool batch = false;
+    for (size_t d = 0; d < rank; d++) {
+        if (dims[d] <= 0) {
+            if (batch) return false;
+            dims[d] = lanes;
+            batch = true;
+        }
+        elems *= (size_t)dims[d];
+    }
+    return true;
+}
+
+// Fills the probe from the session: element types as declared, shapes with the
+// run's lanes substituted in, and element counts the buffers are sized from.
+// Then checks those counts against what this engine will actually feed and
+// read: the assembled window of context-plus-samples per lane, and exactly one
+// score per lane, which is all the out[] array silero_step hands the caller
+// holds. The state is checked by the caller against the buffer silero_begin
+// made for it. A model that declares anything else is not a model this engine
+// knows how to feed.
+static bool model_probe(int lanes, ModelProbe& probe) {
+    ONNXTensorElementDataType window_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    ONNXTensorElementDataType state_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    ONNXTensorElementDataType rate_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    ONNXTensorElementDataType score_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+
+    bool known =
+        shape_by_name(true, input_names[0], window_type, probe.window_dims, probe.window_rank) &&
+        shape_by_name(true, input_names[1], state_type, probe.state_dims, probe.state_rank) &&
+        shape_by_name(true, input_names[2], rate_type, probe.rate_dims, probe.rate_rank) &&
+        shape_by_name(false, output_names[0], score_type, probe.score_dims, probe.score_rank);
+    if (!known) return false;
+
+    // Everything this engine feeds and reads is float, and the sample rate has
+    // always been the one-element int64 the exports declare. A model that
+    // wants anything else is not a model this engine knows how to feed.
+    if (window_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        state_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        score_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        rate_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64) return false;
+    if (probe.rate_rank != 1 || probe.rate_dims[0] != 1) return false;
+
+    if (!sized_dims(probe.window_dims, probe.window_rank, lanes, probe.window_elems)) return false;
+    if (!sized_dims(probe.state_dims, probe.state_rank, lanes, probe.state_elems)) return false;
+    if (!sized_dims(probe.score_dims, probe.score_rank, lanes, probe.score_elems)) return false;
+
+    // The window is what silero_step assembles: context glued in front of the
+    // fresh samples, once per lane. A model that declares a different width,
+    // or a batch this run is not feeding, lands here instead of on a bind
+    // error at the first step.
+    if (probe.window_elems != (size_t)lanes * (SILERO_CONTEXT + SILERO_WINDOW)) return false;
+    if (probe.score_elems != (size_t)lanes) return false;
+    return true;
 }
 
 static std::filesystem::path binary_dir() {
@@ -478,15 +632,30 @@ static void maybe_benchmark() {
 static FastPath* try_fast_path(Lanes& run) {
     if (std::getenv("LAPSE_VAD_NOFAST")) return nullptr;
 
-    int lanes = run.count;
-    int width = SILERO_CONTEXT + SILERO_WINDOW;
+    // Ask the model what it is before laying out a single byte: the shapes,
+    // the dtypes and the score's rank all come off the session, not out of a
+    // comment about which export this engine last met. A model that will not
+    // declare itself stays on the plain path where the runtime allocates its
+    // own everything.
+    ModelProbe probe;
+    if (!model_probe(run.count, probe)) return nullptr;
+
     FastPath* fast = new (std::nothrow) FastPath();
     if (!fast) return nullptr;
 
-    fast->window_bytes = (size_t)lanes * width * sizeof(float);
-    fast->score_bytes = (size_t)lanes * sizeof(float);
-    fast->rate_bytes = sizeof(int64_t);
-    fast->state_bytes = (size_t)2 * lanes * 128 * sizeof(float);
+    fast->window_bytes = probe.window_elems * sizeof(float);
+    fast->score_bytes = probe.score_elems * sizeof(float);
+    fast->rate_bytes = sizeof(int64_t);   // the probe checked: exactly one int64
+    fast->state_bytes = probe.state_elems * sizeof(float);
+
+    // run.state is sized by the silero convention in silero_begin; the fast
+    // path only takes a run over when the model's state is that size byte for
+    // byte, so every wrap of run.state and every copy into and out of it is
+    // exact by construction.
+    if (fast->state_bytes != run.state.size() * sizeof(float)) {
+        fast_teardown(fast);
+        return nullptr;
+    }
 
     fast->pin_window = (float*)pin_alloc(fast->window_bytes);
     fast->pin_score = (float*)pin_alloc(fast->score_bytes);
@@ -499,32 +668,32 @@ static FastPath* try_fast_path(Lanes& run) {
     std::memset(fast->pin_state_zero, 0, fast->state_bytes);
     fast->pin_rate[0] = SILERO_RATE;
 
-    int64_t input_shape[2] = {lanes, width};
-    int64_t state_shape[3] = {2, lanes, 128};
-    int64_t score_shape[1] = {lanes};
-    int64_t scalar_shape[1] = {1};
-
     bool built =
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_window, fast->window_bytes, input_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_window)) &&
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_rate, fast->rate_bytes, scalar_shape, 0, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &fast->v_sr)) &&
-        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_state_zero, fast->state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_zero));
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_window, fast->window_bytes, probe.window_dims, probe.window_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_window)) &&
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_rate, fast->rate_bytes, probe.rate_dims, probe.rate_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &fast->v_sr)) &&
+        ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_state_zero, fast->state_bytes, probe.state_dims, probe.state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_zero));
 
     if (built && provider_is(chosen_provider, "CUDA")) {
         // The recurrent state is the one tensor of this model that only the
         // model itself ever reads. On CUDA it does not need the host at all:
         // two buffers in the provider's own arena swap roles every step, which
-        // takes both its transfers off the critical path.
+        // takes both its transfers off the critical path. The score crosses to
+        // the host through one IoBinding, and IoBinding holds a bound value to
+        // the rank the model declared for that output: [lanes] on the old
+        // exports, [lanes, 1] on the v6 ones. Both are lanes floats end to
+        // end, so the staging stays the same and only the label follows the
+        // declaration the probe read off the session.
         built = built &&
             ok(ort->CreateMemoryInfo("Cuda", OrtDeviceAllocator, cuda_device, OrtMemTypeDefault, &fast->cuda_mem)) &&
             ok(ort->CreateAllocator(session, fast->cuda_mem, &fast->gpu_alloc));
         for (int i = 0; built && i < 2; i++) {
             fast->dev_state[i] = (float*)fast->gpu_alloc->Alloc(fast->gpu_alloc, fast->state_bytes);
             built = fast->dev_state[i] != nullptr &&
-                ok(ort->CreateTensorWithDataAsOrtValue(fast->cuda_mem, fast->dev_state[i], fast->state_bytes, state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_dev_state[i]));
+                ok(ort->CreateTensorWithDataAsOrtValue(fast->cuda_mem, fast->dev_state[i], fast->state_bytes, probe.state_dims, probe.state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_dev_state[i]));
         }
         built = built &&
             ok(ort->CreateMemoryInfo("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault, &fast->host_mem)) &&
-            ok(ort->CreateTensorWithDataAsOrtValue(fast->host_mem, fast->pin_score, fast->score_bytes, score_shape, 1, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_score)) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(fast->host_mem, fast->pin_score, fast->score_bytes, probe.score_dims, probe.score_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_score)) &&
             ok(ort->CreateIoBinding(session, &fast->binding)) &&
             ok(ort->BindInput(fast->binding, input_names[0], fast->v_window)) &&
             ok(ort->BindInput(fast->binding, input_names[2], fast->v_sr)) &&
@@ -535,7 +704,7 @@ static FastPath* try_fast_path(Lanes& run) {
     if (built && !fast->device_state) {
         // Not CUDA (CPU or DirectML): the state stays where it lives, but it is
         // wrapped once now so the per-step tensor churn goes away anyway.
-        built = ok(ort->CreateTensorWithDataAsOrtValue(memory, run.state.data(), run.state.size() * sizeof(float), state_shape, 3, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_host));
+        built = ok(ort->CreateTensorWithDataAsOrtValue(memory, run.state.data(), fast->state_bytes, probe.state_dims, probe.state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_host));
     }
 
     if (!built) {
@@ -701,7 +870,7 @@ int silero_begin(Lanes& run, int lanes) {
     if (lanes < 1) lanes = 1;
 
     run.count = lanes;
-    run.state.assign(2 * lanes * 128, 0.0f);
+    run.state.assign((size_t)SILERO_STATE_DIRS * lanes * SILERO_STATE_HIDDEN, 0.0f);
     run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
     run.window.assign(lanes * (SILERO_CONTEXT + SILERO_WINDOW), 0.0f);
 
@@ -714,7 +883,7 @@ int silero_begin(Lanes& run, int lanes) {
         // the whole fast path before anyone commits to it.
         if (fast && fast->device_state && !silero_step(run, probe.data(), out.data())) silero_end(run);
 
-        run.state.assign(2 * lanes * 128, 0.0f);
+        run.state.assign((size_t)SILERO_STATE_DIRS * lanes * SILERO_STATE_HIDDEN, 0.0f);
         run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
         // whatever the probe left in the device buffers is stale from here on;
         // the next step reads the zeros again and overwrites a slot it never reads
@@ -753,7 +922,7 @@ bool silero_step(Lanes& run, const float* pcm, float* out) {
         done = fast->device_state ? device_run(run, *fast, out) : host_run(run, *fast, out);
     } else {
         int64_t input_shape[2] = {lane_count, width};
-        int64_t state_shape[3] = {2, lane_count, 128};
+        int64_t state_shape[3] = {SILERO_STATE_DIRS, lane_count, SILERO_STATE_HIDDEN};
         int64_t scalar_shape[1] = {1};
         int64_t rate = SILERO_RATE;
 
