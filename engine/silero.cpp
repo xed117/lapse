@@ -193,7 +193,9 @@ static void fast_teardown(FastPath* fast) {
         for (OrtValue* value : fast->v_dev_state) if (value) ort->ReleaseValue(value);
         if (fast->gpu_alloc) {
             for (float* block : fast->dev_state)
-                if (block) ort->AllocatorFree(fast->gpu_alloc, block);
+                // AllocatorFree answers with an OrtStatus; on a teardown there is
+                // nothing left to do about a refusal but say so, which ok() does.
+                if (block) ok(ort->AllocatorFree(fast->gpu_alloc, block));
             ort->ReleaseAllocator(fast->gpu_alloc);
         }
         if (fast->host_mem) ort->ReleaseMemoryInfo(fast->host_mem);
@@ -434,7 +436,7 @@ static std::vector<std::string> list_providers() {
     int count = 0;
     if (ok(ort->GetAvailableProviders(&raw, &count))) {
         for (int i = 0; i < count; i++) names.push_back(raw[i]);
-        ort->ReleaseAvailableProviders(raw, count);
+        ok(ort->ReleaseAvailableProviders(raw, count));
     }
     return names;
 }
@@ -583,9 +585,13 @@ static bool append_provider(OrtSessionOptions* opts, const std::string& provider
 // `options`. On any failure both are left null and the caller tries the next one.
 static bool build_session(const std::filesystem::path& model, const std::string& provider) {
     if (!ok(ort->CreateSessionOptions(&options))) return false;
-    ort->SetIntraOpNumThreads(options, 1);
-    ort->SetInterOpNumThreads(options, 1);
-    ort->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL);
+    // These three answer with an OrtStatus (ORT_API2_STATUS, which recent headers
+    // mark warn_unused_result). A refusal here is never fatal - the session simply
+    // keeps the default threading and optimization level - so ok() logs it and we
+    // carry on, exactly as dropping the status did before, only noisily when wrong.
+    ok(ort->SetIntraOpNumThreads(options, 1));
+    ok(ort->SetInterOpNumThreads(options, 1));
+    ok(ort->SetSessionGraphOptimizationLevel(options, ORT_ENABLE_ALL));
 
     if (!append_provider(options, provider, model)) {
         ort->ReleaseSessionOptions(options);
