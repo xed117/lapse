@@ -535,6 +535,18 @@ static bool append_provider(OrtSessionOptions* opts, const std::string& provider
         try_cuda_option(cuda, "arena_extend_strategy", "kSameAsRequested");
         try_cuda_option(cuda, "cudnn_conv_algo_search", "HEURISTIC");
         try_cuda_option(cuda, "do_copy_in_default_stream", "1");
+        // No enable_cuda_graph here on purpose. The device fast path ping-pongs the
+        // recurrent state between two buffers and binds the host zeros on the first
+        // step after a reset (see device_run). CUDA Graph capture freezes the buffer
+        // addresses at capture time, and the ORT C API exposes no way to repoint a
+        // captured graph's I/O between steps, so enabling it would replay stale state
+        // or fault. For a launch-bound model this small the real lever is batch width,
+        // which silero_preferred_lanes raises on the GPU instead.
+        //
+        // No cudnn_conv_use_max_workspace either. Silero's feature front end is an
+        // STFT and its body is cuBLAS LSTMs, not convolutions, so the cuDNN conv
+        // workspace knob buys nothing here while eating into gpu_mem_limit; leaving
+        // cuDNN's default in place is both faster and safer on a shared card.
 
         bool good = ok(ort->SessionOptionsAppendExecutionProvider_CUDA_V2(opts, cuda));
         ort->ReleaseCUDAProviderOptions(cuda);
@@ -602,7 +614,10 @@ static bool validate_session() {
 }
 
 // LAPSE_VAD_BENCH=<windows> runs a synthetic stream and reports throughput, so GPU and
-// CPU can be compared with the same binary. Goes to stderr, stdout stays clean.
+// CPU can be compared with the same binary. Goes to stderr, stdout stays clean. It
+// benches the lane width the engine will actually run with, because for this model the
+// per-call overhead is most of the cost and a bench pinned to one width measures a
+// configuration nobody uses.
 static void maybe_benchmark() {
     const char* flag = std::getenv("LAPSE_VAD_BENCH");
     if (!flag) return;
@@ -611,7 +626,7 @@ static void maybe_benchmark() {
     if (iterations > 100000) iterations = 100000;
 
     Lanes run;
-    if (silero_begin(run, 8) <= 0) return;
+    if (silero_begin(run, silero_preferred_lanes()) <= 0) return;
 
     std::vector<float> feed((size_t)run.count * SILERO_WINDOW, 0.01f);
     std::vector<float> got(run.count, 0.0f);
@@ -783,12 +798,25 @@ bool silero_open() {
         return false;
     }
 
+    const OrtApiBase* api = base();
     for (int version = ORT_API_VERSION; version >= 11 && !ort; version--)
-        ort = base()->GetApi(version);
+        ort = api->GetApi(version);
     if (!ort) {
         say() << "Silero VAD: onnxruntime is too old, using libfvad\n";
         return false;
     }
+
+    // The runtime is whatever the operator dropped beside the binary, and the GPU
+    // provider is whatever that build was compiled against. A CUDA EP built before a
+    // GPU's compute capability existed loads fine and lists itself in the providers,
+    // then fails at the first kernel - which would otherwise look like "the GPU is
+    // slow" while the CPU does all the work. The version string is what tells the
+    // two apart from the log alone: sm_120 class cards need an onnxruntime built
+    // against CUDA 12.8 or newer. GetVersionString has been in OrtApiBase since the
+    // first C API, so an older runtime still answers it.
+    const char* version_text = api->GetVersionString ? api->GetVersionString() : nullptr;
+    say() << "Silero VAD: onnxruntime " << (version_text ? version_text : "unknown")
+          << ", compiled against C API " << ORT_API_VERSION << "\n";
 
     std::filesystem::path model = find_model();
     if (model.empty()) {
@@ -857,6 +885,12 @@ bool silero_open() {
             gpu = !provider.empty();
             break;
         }
+        // A GPU provider that is advertised but cannot run a throwaway window is the
+        // single most expensive quiet failure this engine can have: everything after
+        // it runs on the CPU at a fraction of the rate with no other signal. Say so.
+        if (!provider.empty())
+            say() << "Silero VAD: " << provider << " is offered but could not run the model, "
+                  << "falling through - check the onnxruntime build against this GPU\n";
         drop_session();
     }
 
@@ -874,6 +908,29 @@ bool silero_open() {
 
 bool silero_on_gpu() {
     return gpu;
+}
+
+// How wide one run should be. On the CPU a step is mostly the model itself, so a
+// modest batch is enough and a huge one only adds staging traffic. On a GPU the
+// opposite holds: the whole 512-sample update is launch-overhead bound - the kernels
+// themselves are over in microseconds and what is paid for is the per-step dispatch -
+// so the width of a step is what turns the same launches into throughput, and the
+// cost per window keeps falling well past the old fixed batch of 8.
+//
+// The number is a request, not a promise. The model's batch axis has to be dynamic
+// for anything above one to work at all, and silero_begin proves a probe step at the
+// requested width before handing the run over, falling back when a model will not
+// take it. The ceiling is where the per-lane pinned staging and the recurrent state
+// still fit inside the CUDA arena alongside everything else on the card.
+int silero_preferred_lanes() {
+    if (!session) return 1;
+
+    const char* forced = std::getenv("LAPSE_VAD_LANES");
+    if (forced) {
+        int lanes = atoi(forced);
+        if (lanes > 0) return lanes > 256 ? 256 : lanes;
+    }
+    return gpu ? 64 : 8;
 }
 
 int silero_begin(Lanes& run, int lanes) {

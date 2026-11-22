@@ -524,6 +524,26 @@ static double loud_level(const std::vector<float>& loudness) {
     return rms[at];
 }
 
+// Turns one window of PCM into the normalized floats the model wants, applying the
+// same gain and the same hard clamp the original inline loop applied.
+//
+// Two things changed from writing it out at the call site. The gain is folded into
+// a single multiplier, and the arithmetic is float instead of double: dividing an
+// int16 by 32768 is exact in binary either way, so the only rounding is the gain
+// multiply and the store, and the whole difference sits under one float ULP of the
+// input sample, which is a few hundred-thousandths of a percent of a value the model
+// then squashes through a sigmoid. What that buys is a loop a compiler can put on
+// vector registers - mixed double-to-float arithmetic with two branches in it does
+// not vectorize, and this is the one pass that touches every sample of the film.
+static void scale_to_float(const int16_t* src, float* dst, int n, float gain) {
+    const float scale = gain * (1.0f / 32768.0f);
+    for (int i = 0; i < n; ++i) {
+        float v = (float)src[i] * scale;
+        v = v > 1.0f ? 1.0f : (v < -1.0f ? -1.0f : v);
+        dst[i] = v;
+    }
+}
+
 static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) {
     std::vector<float> probability;
     std::vector<float> loudness;
@@ -548,8 +568,24 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
         int total = (int)(pcm.size() / SILERO_WINDOW);
         if (total < 8) return {};
 
-        Lanes run;
-        int lanes = (total >= LANES * 64) ? LANES : 1;
+        // Every lane is an independent time slice and starts with no context, so its
+        // first window is fed to the model cold and comes back meaningless. Widening
+        // the batch therefore costs boundary windows, and the only thing that keeps
+        // that cost bounded is how many windows each lane carries: one cold window
+        // out of per is 1/per of the lane. MIN_WINDOWS_PER_LANE is the floor the
+        // batch used to get from the old fixed eight lanes, so whatever width the
+        // provider asks for, the fraction of audio lost to cold starts stays where it
+        // always was. The width itself comes from the provider, which wants it wide on
+        // a GPU because a step there is dispatch bound rather than arithmetic bound.
+        const int MIN_WINDOWS_PER_LANE = 64;
+        int lanes = 1;
+        int wanted = silero_preferred_lanes();
+        while (lanes < wanted && total >= (lanes + 1) * MIN_WINDOWS_PER_LANE) lanes++;
+        // per rounds up, so a wide enough request can put the last lane's start
+        // past the end of the audio: a lane that feeds nothing but zeros, costing
+        // batch width and a sync for no output. Back off until every lane carries
+        // at least one real window.
+        while (lanes > 1 && (int64_t)(lanes - 1) * ((total + lanes - 1) / lanes) >= total) lanes--;
         lanes = silero_begin(run, lanes);
         if (!lanes) return {};
 
@@ -566,13 +602,7 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
                     std::fill(row, row + SILERO_WINDOW, 0.0f);
                     continue;
                 }
-                const int16_t* src = pcm.data() + (size_t)w * SILERO_WINDOW;
-                for (int i = 0; i < SILERO_WINDOW; ++i) {
-                    double v = src[i] / 32768.0 * boost;
-                    if (v > 1.0) v = 1.0;
-                    if (v < -1.0) v = -1.0;
-                    row[i] = (float)v;
-                }
+                scale_to_float(pcm.data() + (size_t)w * SILERO_WINDOW, row, SILERO_WINDOW, (float)boost);
             }
             if (!silero_step(run, feed.data(), got.data())) return {};
             for (int l = 0; l < lanes; ++l) {

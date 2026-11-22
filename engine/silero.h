@@ -58,3 +58,12 @@ bool silero_step(Lanes& run, const float* lanes_pcm, float* out);
 // (CUDA or DirectML). False means the CPU provider. Only meaningful after a
 // successful silero_open(); callers use it for logging and cache keys only.
 bool silero_on_gpu();
+
+// The batch width a caller should ask silero_begin for. The per-call overhead of
+// this model dominates a step, so the width of a step is most of its throughput,
+// and a GPU pays far more overhead per call than a CPU - it wants a wider batch.
+// Callers thin this down when the audio they have will not fill it (every lane
+// needs enough windows to amortize the contextless first one); the value is a
+// request that silero_begin proves against the model before granting it. Only
+// meaningful after a successful silero_open().
+int silero_preferred_lanes();
