@@ -27,7 +27,6 @@ static const int FRAME_SAMPLES = RATE / 100;
 static const int VAD_MODES = 4;
 static const double TARGET_LEVEL = 0.05;
 
-static const int LANES = 8;
 static const int64_t PRIME_MS = 3000;
 static const int64_t PROBE_MS = 180000;
 
@@ -568,6 +567,7 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
         int total = (int)(pcm.size() / SILERO_WINDOW);
         if (total < 8) return {};
 
+        Lanes run;
         // Every lane is an independent time slice and starts with no context, so its
         // first window is fed to the model cold and comes back meaningless. Widening
         // the batch therefore costs boundary windows, and the only thing that keeps
