@@ -590,24 +590,35 @@ static std::vector<float> analyse(const std::vector<int16_t>& pcm, bool silero) 
         if (!lanes) return {};
 
         int per = (total + lanes - 1) / lanes;
-        std::vector<float> feed((size_t)lanes * SILERO_WINDOW);
-        std::vector<float> got(lanes);
+        // A stock step advances every lane by one window; a sequence step
+        // advances every lane by K consecutive ones, which is the whole point
+        // of that export. One is the other with the inner loops running once,
+        // so the feed is always lanes * chunk windows and the fill-back index
+        // is the lane's slice plus the offset inside this step either way.
+        const int chunk = silero_step_width();
+        std::vector<float> feed((size_t)lanes * chunk * SILERO_WINDOW);
+        std::vector<float> got((size_t)lanes * chunk);
         std::vector<float> windows(total, 0.0f);
 
-        for (int step = 0; step < per; ++step) {
+        const int steps = (per + chunk - 1) / chunk;
+        for (int step = 0; step < steps; ++step) {
             for (int l = 0; l < lanes; ++l) {
-                float* row = feed.data() + (size_t)l * SILERO_WINDOW;
-                int w = l * per + step;
-                if (w >= total) {
-                    std::fill(row, row + SILERO_WINDOW, 0.0f);
-                    continue;
+                for (int k = 0; k < chunk; ++k) {
+                    float* row = feed.data() + ((size_t)l * chunk + k) * SILERO_WINDOW;
+                    int w = l * per + step * chunk + k;
+                    if (w >= total) {
+                        std::fill(row, row + SILERO_WINDOW, 0.0f);
+                        continue;
+                    }
+                    scale_to_float(pcm.data() + (size_t)w * SILERO_WINDOW, row, SILERO_WINDOW, (float)boost);
                 }
-                scale_to_float(pcm.data() + (size_t)w * SILERO_WINDOW, row, SILERO_WINDOW, (float)boost);
             }
             if (!silero_step(run, feed.data(), got.data())) return {};
             for (int l = 0; l < lanes; ++l) {
-                int w = l * per + step;
-                if (w < total) windows[w] = got[l];
+                for (int k = 0; k < chunk; ++k) {
+                    int w = l * per + step * chunk + k;
+                    if (w < total) windows[w] = got[(size_t)l * chunk + k];
+                }
             }
         }
 

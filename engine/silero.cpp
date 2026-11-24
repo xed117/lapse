@@ -61,6 +61,17 @@ static bool tried = false;
 static std::mutex open_mutex;
 static bool gpu = false;
 static std::string chosen_provider;
+// Which of the two contracts the live session turned out to answer to, and how
+// many windows of one time slice a single call advances it by. Both are decided
+// once, by read_contract, on the session that won the provider loop, and stay
+// put for the life of it.
+static SileroContract contract = SILERO_CONTRACT_UNKNOWN;
+static int seq_windows = 0;
+// One half of the recurrent state, as the session declared it. The stock
+// contract's is 2 * lanes * 128 for the whole pair, so it is not a per-lane
+// figure; the sequence contract's is per lane and identical for every lane,
+// because its state tensors carry a batch axis the export nailed to one.
+static size_t seq_state_elems = 0;
 static int cuda_device = 0;
 static long long cuda_mem_bytes = 512LL * 1024 * 1024;
 
@@ -79,8 +90,36 @@ static const int SILERO_STATE_HIDDEN = 128;
 // this engine speaks to. Silero's tensors are rank 1 to 3.
 static const size_t MAX_SHAPE_RANK = 4;
 
+// The concrete shapes read_contract settled on, with every dynamic axis
+// resolved to the engine's chosen K. These are what the sequence path builds
+// its tensors from; the probe's copy is transient and lives only as long as
+// the detection call that filled it.
+static int64_t seq_window_dims[2] = {0, 0};
+static int64_t seq_score_dims[MAX_SHAPE_RANK]; static size_t seq_score_rank = 0;
+static int64_t seq_state_dims[MAX_SHAPE_RANK]; static size_t seq_state_rank = 0;
+
 static const char* input_names[]  = {"input", "state", "sr"};
 static const char* output_names[] = {"output", "stateN"};
+
+// The sequence export - silero's own onnx_sequence flavour - answers the same
+// question as the stock one and is otherwise a different program. It has no
+// sample-rate input, because the rate is baked into the graph; it hands the
+// LSTM's two halves over as two separate rank-3 tensors instead of one stacked
+// [2, lanes, 128]; and its leading axis is not a set of independent time slices
+// stepping forward in lockstep, it is how many consecutive windows of a single
+// time slice the model chews through in one call. Those three differences are
+// why the stock names arriving at a sequence model come back as "Invalid input
+// name: state", and why mapping the names across is not enough on its own.
+static const char* seq_input_names[]  = {"input", "h", "c"};
+static const char* seq_output_names[] = {"speech_probs", "hn", "cn"};
+
+// Windows of one time slice per call on the sequence contract. That axis is
+// dynamic, so this number is the engine's choice rather than the model's, and
+// the probe step in silero_begin proves it against the live session before
+// anyone commits to it. 512 is sixteen seconds of audio per call, which is
+// where silero's own benchmarking stops gaining; LAPSE_VAD_CHUNK overrides it.
+static const int SEQ_WINDOWS = 512;
+static const int SEQ_WINDOWS_MAX = 4096;
 
 static bool ok(OrtStatus* status) {
     if (!status) return true;
@@ -327,6 +366,181 @@ static bool model_probe(int lanes, ModelProbe& probe) {
     // error at the first step.
     if (probe.window_elems != (size_t)lanes * (SILERO_CONTEXT + SILERO_WINDOW)) return false;
     if (probe.score_elems != (size_t)lanes) return false;
+    return true;
+}
+
+// Does this session have an I/O of that name at all. Contract detection asks
+// that question before it asks anything about shapes, because the two families
+// this engine speaks to are told apart by their names first and their shapes
+// second - and a name is the one thing that cannot be guessed at or coerced.
+static bool has_io(bool input, const char* name) {
+    ONNXTensorElementDataType type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    int64_t dims[MAX_SHAPE_RANK];
+    size_t rank = 0;
+    return shape_by_name(input, name, type, dims, rank);
+}
+
+// Everything the sequence contract needs proved before a byte is laid out.
+// Unlike the stock probe there is no lane count handed in: this export's state
+// tensors carry a batch axis the exporter nailed to one, so parallelism comes
+// from running lanes one after another and the only axis this engine gets to
+// size is the sequence length, which is how many consecutive windows of a
+// single time slice one call chews through.
+struct SeqProbe {
+    int64_t window_dims[MAX_SHAPE_RANK]; size_t window_rank = 0;
+    int64_t state_dims[MAX_SHAPE_RANK];  size_t state_rank = 0;
+    int64_t score_dims[MAX_SHAPE_RANK];  size_t score_rank = 0;
+    size_t state_elems = 0;
+    // The sequence axis as the model declared it: > 0 when it is nailed down to
+    // a number, in which case this engine has no say in K at all, and -1 when it
+    // is dynamic and K is the engine's to choose.
+    int64_t declared_seq = -1;
+};
+
+static bool same_dims(const int64_t* a, const int64_t* b, size_t rank) {
+    for (size_t d = 0; d < rank; d++) if (a[d] != b[d]) return false;
+    return true;
+}
+
+// Pins the single dynamic axis a state tensor may leave open to one and counts
+// the elements. The sequence export declares h and c as [1, dyn, 128], where
+// that middle axis is the LSTM's own and not a batch this engine owns, so it
+// resolves to one; a state tensor with two axes left open has more freedom than
+// anybody can size a buffer for.
+static bool pin_state_dims(int64_t* dims, size_t rank, size_t& elems) {
+    if (rank < 1 || rank > MAX_SHAPE_RANK) return false;
+    if (dims[0] != 1) return false;
+    elems = 1;
+    bool open = false;
+    for (size_t d = 1; d < rank; d++) {
+        if (dims[d] <= 0) {
+            if (open) return false;
+            dims[d] = 1;
+            open = true;
+        }
+        elems *= (size_t)dims[d];
+    }
+    return elems > 0;
+}
+
+// Reads one of the four state tensors and checks it is the same tensor as a
+// reference: same element type, same rank, same dimensions. hn and cn go back
+// in as h and c on the next call, so a model that spells any of the four
+// differently is not the model this path feeds, and finding that out here beats
+// discovering it as a bind error at the first step.
+static bool state_matches(const char* name, bool input, ONNXTensorElementDataType wanted,
+                          const int64_t* reference, size_t reference_rank) {
+    ONNXTensorElementDataType type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    int64_t dims[MAX_SHAPE_RANK];
+    size_t rank = 0;
+    if (!shape_by_name(input, name, type, dims, rank)) return false;
+    return type == wanted && rank == reference_rank && same_dims(dims, reference, rank);
+}
+
+static bool seq_model_probe(SeqProbe& probe) {
+    ONNXTensorElementDataType window_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    ONNXTensorElementDataType score_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    ONNXTensorElementDataType h_type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+
+    // h is read first and kept as the reference the other three are compared
+    // against. It lands in the probe's own slots because after the comparison
+    // the four are known to agree, and this is the one the buffers are built to.
+    if (!shape_by_name(true, seq_input_names[1], h_type, probe.state_dims, probe.state_rank)) return false;
+
+    bool known =
+        shape_by_name(true, seq_input_names[0], window_type, probe.window_dims, probe.window_rank) &&
+        shape_by_name(false, seq_output_names[0], score_type, probe.score_dims, probe.score_rank) &&
+        state_matches(seq_input_names[2], true, h_type, probe.state_dims, probe.state_rank) &&
+        state_matches(seq_output_names[1], false, h_type, probe.state_dims, probe.state_rank) &&
+        state_matches(seq_output_names[2], false, h_type, probe.state_dims, probe.state_rank);
+    if (!known) return false;
+
+    // Everything fed and read is float. The sequence export has no sample-rate
+    // input at all, which is what its name is short for; one that does is being
+    // read as the stock contract instead.
+    if (window_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        h_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+        score_type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return false;
+
+    // The rows are context glued in front of fresh samples, exactly as the stock
+    // contract assembles them, so the width check is the same one.
+    if (probe.window_rank != 2) return false;
+    if (probe.window_dims[1] != SILERO_CONTEXT + SILERO_WINDOW) return false;
+
+    // One score per window, so the scores and the rows have to agree about how
+    // many windows a call carries. Either may declare it; where both do, they
+    // must agree, and a concrete number on either side is the declared one.
+    if (probe.score_rank != 1) return false;
+    if (probe.window_dims[0] > 0 && probe.score_dims[0] > 0 &&
+        probe.window_dims[0] != probe.score_dims[0]) return false;
+    probe.declared_seq = probe.window_dims[0] > 0 ? probe.window_dims[0]
+                     : probe.score_dims[0] > 0 ? probe.score_dims[0] : -1;
+    if (probe.declared_seq > SEQ_WINDOWS_MAX) return false;
+
+    // The state is one lane's worth and no more: its leading axis is the batch
+    // the export nailed to one, which is why lanes here are separate calls
+    // rather than one batch. Rank 3 because this is the [1, dir, hidden] the
+    // exporter writes, and the element count is what every lane's buffer and
+    // every ping-pong slot is sized by.
+    if (probe.state_rank != 3) return false;
+    if (!pin_state_dims(probe.state_dims, probe.state_rank, probe.state_elems)) return false;
+    return probe.state_elems > 0;
+}
+
+// Decides which of the two contracts the live session answers to, and with the
+// sequence one, how wide a call it wants. Runs on a session that has just been
+// built and before anything has been run through it, because it is the answer
+// that picks which code runs the first throwaway window. Stock is checked first
+// so an export this engine has always spoken to keeps being read the way it
+// always was; a model that answers to neither is rejected here, loudly, rather
+// than being fed stock names and coming back as "Invalid input name: state"
+// from every provider in turn.
+static bool read_contract() {
+    contract = SILERO_CONTRACT_UNKNOWN;
+    seq_windows = 0;
+    seq_state_elems = 0;
+    seq_score_rank = 0;
+    seq_state_rank = 0;
+    seq_window_dims[0] = seq_window_dims[1] = 0;
+
+    bool stock = has_io(true, input_names[0]) && has_io(true, input_names[1]) &&
+                 has_io(true, input_names[2]) && has_io(false, output_names[0]) &&
+                 has_io(false, output_names[1]);
+    if (stock) {
+        contract = SILERO_CONTRACT_STOCK;
+        return true;
+    }
+
+    bool named = has_io(true, seq_input_names[0]) && has_io(true, seq_input_names[1]) &&
+                 has_io(true, seq_input_names[2]) && has_io(false, seq_output_names[0]) &&
+                 has_io(false, seq_output_names[1]) && has_io(false, seq_output_names[2]);
+    if (!named) return false;
+
+    SeqProbe probe;
+    if (!seq_model_probe(probe)) return false;
+
+    int want = SEQ_WINDOWS;
+    const char* forced = std::getenv("LAPSE_VAD_CHUNK");
+    if (forced) {
+        int asked = atoi(forced);
+        if (asked > 0) want = asked > SEQ_WINDOWS_MAX ? SEQ_WINDOWS_MAX : asked;
+    }
+    // A model with the axis nailed down is not open to suggestions.
+    if (probe.declared_seq > 0) want = (int)probe.declared_seq;
+    if (want < 1) want = 1;
+
+    seq_windows = want;
+    seq_state_elems = probe.state_elems;
+    // The shapes the sequence path will build its tensors from: the window
+    // block and the score both carry the chosen K on their leading axis, and
+    // the state dims are the pinned ones the probe already resolved to one.
+    seq_window_dims[0] = want;
+    seq_window_dims[1] = SILERO_CONTEXT + SILERO_WINDOW;
+    seq_score_rank = probe.score_rank;
+    seq_score_dims[0] = want;
+    seq_state_rank = probe.state_rank;
+    for (size_t d = 0; d < seq_state_rank; d++) seq_state_dims[d] = probe.state_dims[d];
+    contract = SILERO_CONTRACT_SEQUENCE;
     return true;
 }
 
@@ -634,8 +848,9 @@ static void maybe_benchmark() {
     Lanes run;
     if (silero_begin(run, silero_preferred_lanes()) <= 0) return;
 
-    std::vector<float> feed((size_t)run.count * SILERO_WINDOW, 0.01f);
-    std::vector<float> got(run.count, 0.0f);
+    const int step = silero_step_width();
+    std::vector<float> feed((size_t)run.count * step * SILERO_WINDOW, 0.01f);
+    std::vector<float> got((size_t)run.count * step, 0.0f);
 
     auto start = std::chrono::steady_clock::now();
     bool alive = true;
@@ -645,10 +860,10 @@ static void maybe_benchmark() {
     if (!alive) return;
 
     double ms = std::chrono::duration<double, std::milli>(stop - start).count();
-    double windows = (double)iterations * run.count;
+    double windows = (double)iterations * run.count * step;
     double per_second = ms > 0.0 ? windows / (ms / 1000.0) : 0.0;
     say() << "Silero VAD bench (" << chosen_provider << "): " << iterations << " x "
-          << run.count << " lanes = " << (long long)windows << " windows in " << ms
+          << run.count << " lanes x " << step << " windows = " << (long long)windows << " windows in " << ms
           << "ms, " << (windows > 0 ? ms / windows : 0.0) << "ms each, "
           << per_second << " windows/s\n";
 }
@@ -744,6 +959,7 @@ static FastPath* try_fast_path(Lanes& run) {
         return nullptr;
     }
     run.fast = fast;
+    run.fast_kind = FAST_STOCK;
     return fast;
 }
 
@@ -783,6 +999,358 @@ static bool host_run(Lanes& run, FastPath& fast, float* out) {
     }
     for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
     return done;
+}
+
+int silero_step_width() {
+    return contract == SILERO_CONTRACT_SEQUENCE && seq_windows > 0 ? seq_windows : 1;
+}
+
+SileroContract silero_contract() {
+    return contract;
+}
+
+// The sequence contract's answer to FastPath: everything one run touches every
+// step, parked once instead of rebuilt per call. The shape of the problem is
+// different enough that sharing the stock struct would only hide the
+// differences - here the staging is a whole K-row block of one lane rather than
+// one row per lane, and the recurrent state is not one buffer advanced in
+// lockstep but one pair per lane, each pair a private history the model carries
+// forward through every call this lane makes. On CUDA that per-lane pair
+// ping-pongs between two arena buffers exactly like the stock device state
+// does, so a lane's history never leaves the card either; the only transfers
+// left per step are the K-row block in and the K scores out.
+struct SeqFastPath {
+    bool device_state = false;         // CUDA only: each lane's state stays on the device
+    int active = 0;                    // which device slot the last step wrote, per-lane parity
+    bool pending_zero = true;          // the next step reads the zero state
+
+    size_t block_bytes = 0;            // one lane's K rows of context plus samples
+    size_t score_bytes = 0;            // one lane's K scores
+    size_t state_bytes = 0;            // one half of one lane's state, as the session declared it
+    size_t pair_bytes = 0;             // h and c together, as the host buffers hold them
+
+    float* pin_block = nullptr;        // page-locked input staging, one lane's K rows
+    float* pin_score = nullptr;        // page-locked score output, K of them
+    float* pin_state_zero = nullptr;   // page-locked zeros for both halves, first step after a reset
+
+    OrtValue* v_block = nullptr;       // wraps pin_block, rebound per lane at bind time
+    OrtValue* v_score = nullptr;       // wraps pin_score, K scores wide
+
+    // Per lane the state is one h and one c; off the device they sit back to
+    // back in run.state exactly as the plain path leaves them there, wrapped
+    // once as v_h_host / v_c_host so silero_begin's reset reaches them too. On
+    // CUDA each half has two device slots and a step ping-pongs between them,
+    // so the buffer a step reads is never the one it writes even mid-flight on
+    // the stream. Device vectors are indexed lane * 2 + slot, slot the active
+    // parity.
+    std::vector<OrtValue*> v_state_zero;      // per lane * 2: zero h, zero c (device first step)
+    std::vector<OrtValue*> v_h_host;          // per lane: wraps this lane's h in run.state
+    std::vector<OrtValue*> v_c_host;          // per lane: wraps this lane's c in run.state
+    std::vector<OrtValue*> v_h_dev;           // per lane * 2: device h slots
+    std::vector<OrtValue*> v_c_dev;           // per lane * 2: device c slots
+    std::vector<float*> dev_h;                // per lane * 2: raw device h, for freeing
+    std::vector<float*> dev_c;                // per lane * 2: raw device c, for freeing
+
+    OrtIoBinding* binding = nullptr;
+    OrtMemoryInfo* cuda_mem = nullptr;
+    OrtMemoryInfo* host_mem = nullptr;
+    OrtAllocator* gpu_alloc = nullptr;
+};
+
+static void seq_teardown(SeqFastPath* fast) {
+    if (!fast) return;
+    if (ort) {
+        if (fast->binding) ort->ReleaseIoBinding(fast->binding);
+        if (fast->v_block) ort->ReleaseValue(fast->v_block);
+        if (fast->v_score) ort->ReleaseValue(fast->v_score);
+        for (OrtValue* value : fast->v_state_zero) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : fast->v_h_host) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : fast->v_c_host) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : fast->v_h_dev) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : fast->v_c_dev) if (value) ort->ReleaseValue(value);
+        if (fast->gpu_alloc) {
+            for (float* block : fast->dev_h)
+                // AllocatorFree answers with an OrtStatus; on a teardown there is
+                // nothing left to do about a refusal but say so, which ok() does.
+                if (block) ok(ort->AllocatorFree(fast->gpu_alloc, block));
+            for (float* block : fast->dev_c)
+                if (block) ok(ort->AllocatorFree(fast->gpu_alloc, block));
+            ort->ReleaseAllocator(fast->gpu_alloc);
+        }
+        if (fast->host_mem) ort->ReleaseMemoryInfo(fast->host_mem);
+        if (fast->cuda_mem) ort->ReleaseMemoryInfo(fast->cuda_mem);
+    }
+    pin_free(fast->pin_block, fast->block_bytes);
+    pin_free(fast->pin_score, fast->score_bytes);
+    pin_free(fast->pin_state_zero, fast->pair_bytes);
+    delete fast;
+}
+
+// Bolts the sequence plumbing onto a run whose probe step already passed, for
+// the K-windows-per-call export. Mirrors what try_fast_path is for the stock
+// contract, with the shape of the work swapped: one K-row staging block that
+// gets rebound to each lane in turn rather than one row per lane, and a state
+// pair per lane that on CUDA never comes back to the host. The binding's I/O
+// names are bound once; only the three tensors whose contents differ per lane
+// - the block, the state pair, and the score landing pad - get rebound per
+// lane. Any miss drops the attempt whole and the run keeps working the slow
+// way, exactly like the stock fast path.
+static SeqFastPath* try_seq_fast_path(Lanes& run) {
+    if (std::getenv("LAPSE_VAD_NOFAST")) return nullptr;
+    if (seq_windows < 1 || seq_state_elems < 1) return nullptr;
+
+    SeqFastPath* fast = new (std::nothrow) SeqFastPath();
+    if (!fast) return nullptr;
+
+    const int K = seq_windows;
+    const int width = SILERO_CONTEXT + SILERO_WINDOW;
+    fast->block_bytes = (size_t)K * width * sizeof(float);
+    fast->score_bytes = (size_t)K * sizeof(float);
+    fast->state_bytes = seq_state_elems * sizeof(float);
+    fast->pair_bytes = fast->state_bytes * 2;
+
+    // run.state is sized by silero_begin as two halves per lane; the fast path
+    // only takes a run over when the session's state is that size byte for
+    // byte, so every wrap and copy is exact by construction.
+    if (fast->pair_bytes * (size_t)run.count != run.state.size() * sizeof(float)) {
+        seq_teardown(fast);
+        return nullptr;
+    }
+
+    fast->pin_block = (float*)pin_alloc(fast->block_bytes);
+    fast->pin_score = (float*)pin_alloc(fast->score_bytes);
+    fast->pin_state_zero = (float*)pin_alloc(fast->pair_bytes);
+    if (!fast->pin_block || !fast->pin_score || !fast->pin_state_zero) {
+        seq_teardown(fast);
+        return nullptr;
+    }
+    std::memset(fast->pin_state_zero, 0, fast->pair_bytes);
+
+    fast->v_state_zero.assign((size_t)run.count * 2, nullptr);
+    fast->v_h_host.assign(run.count, nullptr);
+    fast->v_c_host.assign(run.count, nullptr);
+    fast->v_h_dev.assign((size_t)run.count * 2, nullptr);
+    fast->v_c_dev.assign((size_t)run.count * 2, nullptr);
+    fast->dev_h.assign((size_t)run.count * 2, nullptr);
+    fast->dev_c.assign((size_t)run.count * 2, nullptr);
+
+    bool built = ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_block, fast->block_bytes,
+        seq_window_dims, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_block));
+
+    if (built && provider_is(chosen_provider, "CUDA")) {
+        // The per-lane state is the one tensor of this model that only the
+        // model itself ever reads. On CUDA it does not need the host at all:
+        // two buffers in the provider's own arena swap roles every step, which
+        // takes both its transfers off the critical path. h and c ping-pong
+        // together, so a step reads h[i] and c[i] and writes h[i]'s and c[i]'s
+        // partners, which never alias even mid-flight on the stream.
+        built = built &&
+            ok(ort->CreateMemoryInfo("Cpu", OrtDeviceAllocator, 0, OrtMemTypeDefault, &fast->host_mem)) &&
+            ok(ort->CreateMemoryInfo("Cuda", OrtDeviceAllocator, cuda_device, OrtMemTypeDefault, &fast->cuda_mem)) &&
+            ok(ort->CreateAllocator(session, fast->cuda_mem, &fast->gpu_alloc)) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(fast->host_mem, fast->pin_score, fast->score_bytes,
+                seq_score_dims, seq_score_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_score)) &&
+            ok(ort->CreateIoBinding(session, &fast->binding)) &&
+            ok(ort->BindInput(fast->binding, seq_input_names[0], fast->v_block));
+
+        // Two device slots per half per lane: a step reads the slot the last
+        // step wrote and writes the other, exactly the ping-pong the stock
+        // device state runs, with one pair of buffers per lane.
+        for (int l = 0; built && l < run.count; l++) {
+            for (int slot = 0; built && slot < 2; slot++) {
+                size_t idx = (size_t)l * 2 + slot;
+                fast->dev_h[idx] = (float*)fast->gpu_alloc->Alloc(fast->gpu_alloc, fast->state_bytes);
+                fast->dev_c[idx] = (float*)fast->gpu_alloc->Alloc(fast->gpu_alloc, fast->state_bytes);
+                built = fast->dev_h[idx] != nullptr && fast->dev_c[idx] != nullptr &&
+                    ok(ort->CreateTensorWithDataAsOrtValue(fast->cuda_mem, fast->dev_h[idx], fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_h_dev[idx])) &&
+                    ok(ort->CreateTensorWithDataAsOrtValue(fast->cuda_mem, fast->dev_c[idx], fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_c_dev[idx]));
+            }
+        }
+        if (built) fast->device_state = true;
+    }
+
+    if (built) {
+        for (int l = 0; built && l < run.count; l++) {
+            // On CUDA the first step after a reset reads the pinned zeros, h and
+            // c as two values over the same zeros because the model takes them
+            // as two inputs. Off the device the pair lives in run.state, where
+            // the plain path keeps it too, and is wrapped in place one value per
+            // half, so no step rebuilds them and silero_begin's reset of that
+            // vector reaches this path as well.
+            if (fast->device_state) {
+                built =
+                    ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_state_zero, fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_zero[l * 2])) &&
+                    ok(ort->CreateTensorWithDataAsOrtValue(memory, fast->pin_state_zero + seq_state_elems, fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_state_zero[l * 2 + 1]));
+            } else {
+                float* half = run.state.data() + (size_t)l * seq_state_elems * 2;
+                built =
+                    ok(ort->CreateTensorWithDataAsOrtValue(memory, half, fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_h_host[l])) &&
+                    ok(ort->CreateTensorWithDataAsOrtValue(memory, half + seq_state_elems, fast->state_bytes,
+                        seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &fast->v_c_host[l]));
+            }
+        }
+    }
+
+    if (!built) {
+        seq_teardown(fast);
+        return nullptr;
+    }
+    run.fast = fast;
+    run.fast_kind = FAST_SEQUENCE;
+    return fast;
+}
+
+// One call, one lane: the model runs the K rows of this lane's block and hands
+// back K scores and the next state pair. On CUDA the state pair ping-pongs
+// through the device slots behind the binding; everywhere else the pair lives
+// in the host buffer and the run reads and writes it in place, which is the
+// same Run the plain path makes, just with the input side wrapped once for good.
+static bool sequence_run(Lanes& run, SeqFastPath& fast, int lane, float* out) {
+    const int K = seq_windows;
+    float* half = run.state.data() + (size_t)lane * seq_state_elems * 2;
+
+    bool done = false;
+    if (fast.device_state) {
+        const size_t read_slot = (size_t)lane * 2 + (size_t)fast.active;
+        const size_t write_slot = (size_t)lane * 2 + (size_t)(1 - fast.active);
+        OrtValue* incoming_h = fast.pending_zero ? fast.v_state_zero[lane * 2] : fast.v_h_dev[read_slot];
+        OrtValue* incoming_c = fast.pending_zero ? fast.v_state_zero[lane * 2 + 1] : fast.v_c_dev[read_slot];
+        if (ok(ort->BindInput(fast.binding, seq_input_names[0], fast.v_block)) &&
+            ok(ort->BindInput(fast.binding, seq_input_names[1], incoming_h)) &&
+            ok(ort->BindInput(fast.binding, seq_input_names[2], incoming_c)) &&
+            ok(ort->BindOutput(fast.binding, seq_output_names[0], fast.v_score)) &&
+            ok(ort->BindOutput(fast.binding, seq_output_names[1], fast.v_h_dev[write_slot])) &&
+            ok(ort->BindOutput(fast.binding, seq_output_names[2], fast.v_c_dev[write_slot])) &&
+            ok(ort->RunWithBinding(session, nullptr, fast.binding))) {
+            float* score = nullptr;
+            if (ok(ort->GetTensorMutableData(fast.v_score, (void**)&score))) {
+                std::copy(score, score + K, out + (size_t)lane * K);
+                done = true;
+            }
+        }
+    } else {
+        // The block, h and c are all wrapped once and reused; only the three
+        // outputs are fresh per call, because the runtime allocates those. The
+        // state copies land in run.state through the same pointers the input
+        // values wrap, so the next call reads them without any rebinding.
+        OrtValue* in[3] = {fast.v_block, fast.v_h_host[lane], fast.v_c_host[lane]};
+        OrtValue* res[3] = {nullptr, nullptr, nullptr};
+        if (ok(ort->Run(session, nullptr, seq_input_names, in, 3, seq_output_names, 3, res))) {
+            float* score = nullptr;
+            float* hn = nullptr;
+            float* cn = nullptr;
+            if (ok(ort->GetTensorMutableData(res[0], (void**)&score)) &&
+                ok(ort->GetTensorMutableData(res[1], (void**)&hn)) &&
+                ok(ort->GetTensorMutableData(res[2], (void**)&cn))) {
+                std::copy(score, score + K, out + (size_t)lane * K);
+                std::copy(hn, hn + seq_state_elems, half);
+                std::copy(cn, cn + seq_state_elems, half + seq_state_elems);
+                done = true;
+            }
+        }
+        for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
+    }
+    return done;
+}
+
+// The plain sequence path: the runtime allocates its own everything and every
+// tensor is wrapped fresh per lane. The K rows of one lane are assembled into
+// a scratch block first, because the context chaining below reads the tail of
+// the row before it, and that row has to be the one that was actually fed.
+static bool sequence_step_plain(Lanes& run, const float* pcm, float* out) {
+    const int K = seq_windows;
+    const int width = SILERO_CONTEXT + SILERO_WINDOW;
+    std::vector<float> block((size_t)K * width);
+    int64_t block_shape[2] = {K, width};
+
+    for (int l = 0; l < run.count; l++) {
+        float* half = run.state.data() + (size_t)l * seq_state_elems * 2;
+        float* lane_context = run.context.data() + (size_t)l * SILERO_CONTEXT;
+
+        for (int k = 0; k < K; k++) {
+            float* row = block.data() + (size_t)k * width;
+            const float* src = lane_context;
+            if (k > 0) {
+                // the row before it becomes this row's context: exactly what the
+                // reference frame_blocks() does with contexts[1:]
+                src = row - width + SILERO_WINDOW;
+            }
+            std::copy(src, src + SILERO_CONTEXT, row);
+            std::copy(pcm + ((size_t)l * K + k) * SILERO_WINDOW,
+                      pcm + ((size_t)l * K + k + 1) * SILERO_WINDOW, row + SILERO_CONTEXT);
+        }
+
+        OrtValue* in[3] = {nullptr, nullptr, nullptr};
+        OrtValue* res[3] = {nullptr, nullptr, nullptr};
+        bool ready =
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, block.data(), block.size() * sizeof(float),
+                block_shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[0])) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, half, seq_state_elems * sizeof(float),
+                seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[1])) &&
+            ok(ort->CreateTensorWithDataAsOrtValue(memory, half + seq_state_elems, seq_state_elems * sizeof(float),
+                seq_state_dims, seq_state_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &in[2]));
+
+        bool done = false;
+        if (ready && ok(ort->Run(session, nullptr, seq_input_names, in, 3, seq_output_names, 3, res))) {
+            float* score = nullptr;
+            float* hn = nullptr;
+            float* cn = nullptr;
+            if (ok(ort->GetTensorMutableData(res[0], (void**)&score)) &&
+                ok(ort->GetTensorMutableData(res[1], (void**)&hn)) &&
+                ok(ort->GetTensorMutableData(res[2], (void**)&cn))) {
+                std::copy(score, score + K, out + (size_t)l * K);
+                std::copy(hn, hn + seq_state_elems, half);
+                std::copy(cn, cn + seq_state_elems, half + seq_state_elems);
+                done = true;
+            }
+        }
+        for (OrtValue* value : res) if (value) ort->ReleaseValue(value);
+        for (OrtValue* value : in) if (value) ort->ReleaseValue(value);
+        if (!done) return false;
+
+        // the tail of the last row fed becomes the first row's context next call
+        std::copy(block.data() + (size_t)(K - 1) * width + SILERO_WINDOW,
+                  block.data() + (size_t)K * width, lane_context);
+    }
+    return true;
+}
+
+// The sequence contract's step: assemble each lane's K rows, run the model once
+// per lane, and write back the context that chains into the next call. The
+// caller has laid out its audio and score arrays at K windows per lane, in time
+// order, which is the whole difference between this and the stock contract.
+static bool sequence_step(Lanes& run, const float* pcm, float* out) {
+    SeqFastPath* fast = static_cast<SeqFastPath*>(run.fast);
+    if (!fast) return sequence_step_plain(run, pcm, out);
+
+    const int K = seq_windows;
+    const int width = SILERO_CONTEXT + SILERO_WINDOW;
+
+    for (int l = 0; l < run.count; l++) {
+        float* row = fast->pin_block;
+        const float* src = run.context.data() + (size_t)l * SILERO_CONTEXT;
+        for (int k = 0; k < K; k++) {
+            if (k > 0) src = row - width + SILERO_WINDOW;
+            std::copy(src, src + SILERO_CONTEXT, row);
+            std::copy(pcm + ((size_t)l * K + k) * SILERO_WINDOW,
+                      pcm + ((size_t)l * K + k + 1) * SILERO_WINDOW, row + SILERO_CONTEXT);
+            row += width;
+        }
+        if (!sequence_run(run, *fast, l, out)) return false;
+        // the tail of this lane's last row becomes the head of its next call;
+        // it must be saved now, before the next lane overwrites the staging block
+        const float* last = row - width;
+        std::copy(last + SILERO_WINDOW, last + width,
+                  run.context.data() + (size_t)l * SILERO_CONTEXT);
+    }
+    fast->active = 1 - fast->active;
+    fast->pending_zero = false;
+    return true;
 }
 
 bool silero_open() {
@@ -885,8 +1453,27 @@ bool silero_open() {
     }
     say() << "Silero VAD: onnxruntime offers " << (reported.empty() ? "nothing" : reported) << "\n";
 
+    // The contract is read between building and validating, because it is the
+    // answer that picks which code runs the first throwaway window. It is also a
+    // property of the file, not of the provider that loaded it: a model that
+    // answers to neither contract is rejected here instead of being fed stock
+    // names and coming back as "Invalid input name: state" from every provider
+    // in turn, which is what made an unsupported model read like a GPU fault.
+    bool shape_rejected = false;
     for (const std::string& provider : order) {
-        if (build_session(model, provider) && validate_session()) {
+        if (!build_session(model, provider)) {
+            drop_session();
+            continue;
+        }
+        if (!read_contract()) {
+            shape_rejected = true;
+            say() << "Silero VAD: " << model.string()
+                  << " matches neither the stock contract (input/state/sr) nor the "
+                  << "sequence contract (input/h/c), using libfvad\n";
+            drop_session();
+            break;
+        }
+        if (validate_session()) {
             chosen_provider = provider;
             gpu = !provider.empty();
             break;
@@ -902,12 +1489,17 @@ bool silero_open() {
 
     if (!session) {
         if (memory) { ort->ReleaseMemoryInfo(memory); memory = nullptr; }
-        say() << "Silero VAD: could not load the model, using libfvad\n";
+        if (!shape_rejected)
+            say() << "Silero VAD: could not load the model, using libfvad\n";
         return false;
     }
 
     say() << "Silero VAD: " << model.string() << " ["
-          << (gpu ? chosen_provider : std::string("CPU provider")) << "]\n";
+          << (gpu ? chosen_provider : std::string("CPU provider")) << "]"
+          << (contract == SILERO_CONTRACT_SEQUENCE
+                  ? " sequence contract, " + std::to_string(seq_windows) + " windows per call"
+                  : " stock contract")
+          << "\n";
     maybe_benchmark();
     return true;
 }
@@ -936,6 +1528,11 @@ int silero_preferred_lanes() {
         int lanes = atoi(forced);
         if (lanes > 0) return lanes > 256 ? 256 : lanes;
     }
+    // The sequence contract batches along time, not lanes: its state is nailed to
+    // one stream, so a wider run is just more Runs in series, each with a private
+    // state pair. The K windows per call are the whole win; extra lanes only add
+    // staging and device buffers. LAPSE_VAD_LANES above still overrides.
+    if (contract == SILERO_CONTRACT_SEQUENCE) return 1;
     return gpu ? 64 : 8;
 }
 
@@ -943,21 +1540,48 @@ int silero_begin(Lanes& run, int lanes) {
     if (!session) return 0;
     if (lanes < 1) lanes = 1;
 
+    const int step = silero_step_width();
     run.count = lanes;
-    run.state.assign((size_t)SILERO_STATE_DIRS * lanes * SILERO_STATE_HIDDEN, 0.0f);
+    // The sequence contract keeps one h/c pair per lane, the stock one a single
+    // [2, lanes, 128] block; either way the run owns the whole state as two
+    // halves per lane and every fast path wraps it in place.
+    const size_t per_lane_state = contract == SILERO_CONTRACT_SEQUENCE
+                                      ? (size_t)2 * seq_state_elems
+                                      : (size_t)SILERO_STATE_DIRS * SILERO_STATE_HIDDEN;
+    run.state.assign(per_lane_state * lanes, 0.0f);
     run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
     run.window.assign(lanes * (SILERO_CONTEXT + SILERO_WINDOW), 0.0f);
 
-    std::vector<float> probe(lanes * SILERO_WINDOW, 0.0f);
-    std::vector<float> out(lanes, 0.0f);
+    // The probe feeds the same layout the real steps will: one block per lane,
+    // each block step windows deep, which is one window for stock and K for the
+    // sequence contract.
+    std::vector<float> probe((size_t)lanes * step * SILERO_WINDOW, 0.0f);
+    std::vector<float> out((size_t)lanes * step, 0.0f);
     if (silero_step(run, probe.data(), out.data())) {
+        if (contract == SILERO_CONTRACT_SEQUENCE) {
+            SeqFastPath* fast = try_seq_fast_path(run);
+            // A device binding that survives setup but chokes at Run time would
+            // fail the film, not just slow it, so spend one throwaway step proving
+            // the whole fast path before anyone commits to it.
+            if (fast && fast->device_state && !silero_step(run, probe.data(), out.data())) silero_end(run);
+
+            run.state.assign(per_lane_state * lanes, 0.0f);
+            run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
+            // whatever the probe left in the device buffers is stale from here on;
+            // the next step reads the zeros again and overwrites a slot it never
+            // reads. Off the device the wrapped state was just zeroed with the
+            // vector above, which is why this flag only steers the device path.
+            if (run.fast) static_cast<SeqFastPath*>(run.fast)->pending_zero = true;
+            return lanes;
+        }
+
         FastPath* fast = try_fast_path(run);
         // A device binding that survives setup but chokes at Run time would
         // fail the film, not just slow it, so spend one throwaway step proving
         // the whole fast path before anyone commits to it.
         if (fast && fast->device_state && !silero_step(run, probe.data(), out.data())) silero_end(run);
 
-        run.state.assign((size_t)SILERO_STATE_DIRS * lanes * SILERO_STATE_HIDDEN, 0.0f);
+        run.state.assign(per_lane_state * lanes, 0.0f);
         run.context.assign(lanes * SILERO_CONTEXT, 0.0f);
         // whatever the probe left in the device buffers is stale from here on;
         // the next step reads the zeros again and overwrites a slot it never reads
@@ -973,6 +1597,10 @@ int silero_begin(Lanes& run, int lanes) {
 
 bool silero_step(Lanes& run, const float* pcm, float* out) {
     if (!session || run.count < 1) return false;
+    // The sequence contract takes a different tensor - input/h/c, K rows of one
+    // lane per call - and owns its staging, context chaining and per-lane state;
+    // everything below is the stock [lanes, 576] + sr + state contract only.
+    if (contract == SILERO_CONTRACT_SEQUENCE) return sequence_step(run, pcm, out);
     int width = SILERO_CONTEXT + SILERO_WINDOW;
     std::vector<float>& state = run.state;
     std::vector<float>& context = run.context;
@@ -1036,9 +1664,13 @@ bool silero_step(Lanes& run, const float* pcm, float* out) {
 
 void silero_end(Lanes& run) {
     if (!run.fast) return;
-    FastPath* fast = static_cast<FastPath*>(run.fast);
+    void* fast = run.fast;
     run.fast = nullptr;
-    fast_teardown(fast);
+    // Which struct the run.fast pointer points at is remembered per run: the two
+    // contracts build different ones, and freeing the wrong one walks garbage.
+    if (run.fast_kind == FAST_SEQUENCE) seq_teardown(static_cast<SeqFastPath*>(fast));
+    else fast_teardown(static_cast<FastPath*>(fast));
+    run.fast_kind = FAST_NONE;
 }
 
 void silero_close() {
@@ -1052,6 +1684,9 @@ void silero_close() {
     ort = nullptr;
     gpu = false;
     chosen_provider.clear();
+    contract = SILERO_CONTRACT_UNKNOWN;
+    seq_windows = 0;
+    seq_state_elems = 0;
 
     if (library) {
 #ifdef _WIN32
